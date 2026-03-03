@@ -1,0 +1,86 @@
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  vector-db:
+    image: chromadb/chroma:latest
+    ports:
+      - "${CHROMA_BIND_PORT}:8000"
+    environment:
+      - IS_PERSISTENT=TRUE
+    volumes:
+      - chroma_data:/chroma/chroma
+    restart: unless-stopped
+
+  openwebui-knowledge:
+    build:
+      context: ./mcp/openwebui-knowledge
+    depends_on:
+      - openwebui
+    ports:
+      - "127.0.0.1:8787:8787"
+    environment:
+      - MCP_HOST=0.0.0.0
+      - MCP_PORT=8787
+      - OPENWEBUI_BASE_URL=http://openwebui:8080
+      - OPENWEBUI_API_KEY=${OPENWEBUI_API_KEY}
+      # (optional) specify a default collection to sync with, otherwise it will sync with the default collection of the OpenWebUI instance  
+      - OPENWEBUI_DEFAULT_COLLECTION=${OPENWEBUI_DEFAULT_COLLECTION}
+    restart: unless-stopped
+
+  openwebui:
+    image: ghcr.io/open-webui/open-webui:main
+    depends_on:
+      - postgres
+      - vector-db
+    ports:
+      - "${WEBUI_BIND_PORT}:8080"
+    volumes:
+      - open_webui_data:/app/backend/data
+    environment:
+      - DATABASE_URL=${OPENWEBUI_DATABASE_URL}
+      - ENABLE_PERSISTENT_CONFIG=${OPENWEBUI_ENABLE_PERSISTENT_CONFIG}
+
+      - VECTOR_DB=chroma
+      - CHROMA_HTTP_HOST=vector-db
+      - CHROMA_HTTP_PORT=8000
+      - CHROMA_TENANT=default_tenant
+      - CHROMA_DATABASE=default_database
+
+      - OPENAI_API_BASE_URL=${UPSTREAM_OPENAI_BASE_URL}
+      - OPENAI_API_KEY=${UPSTREAM_OPENAI_API_KEY}
+
+      - WEBUI_ADMIN_EMAIL=${WEBUI_ADMIN_EMAIL}
+      - WEBUI_ADMIN_PASSWORD=${WEBUI_ADMIN_PASSWORD}
+      - WEBUI_ADMIN_NAME=${WEBUI_ADMIN_NAME}
+      - WEBUI_URL=${WEBUI_URL}
+
+      - ENABLE_OLLAMA=false
+    restart: unless-stopped
+
+  # pipelines:
+  #   image: ghcr.io/open-webui/pipelines:main
+  #   ports:
+  #     - "127.0.0.1:9099:9099"
+  #   volumes:
+  #     - pipelines_data:/app/pipelines
+  #   environment:
+  #     - PIPELINES_API_KEY=${PIPELINES_API_KEY}
+  #     - PIPELINES_MODELS=${PIPELINES_MODELS}
+  #     # Provide your upstream LLM here
+  #     - OPENAI_API_KEY=${UPSTREAM_OPENAI_API_KEY}
+  #     - OPENAI_BASE_URL=${UPSTREAM_OPENAI_BASE_URL}
+  #   restart: unless-stopped
+  
+volumes:
+  pg_data:
+  chroma_data:
+  open_webui_data:
+  # pipelines_data:
