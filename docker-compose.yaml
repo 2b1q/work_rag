@@ -10,7 +10,7 @@ services:
     restart: unless-stopped
 
   vector-db:
-    image: chromadb/chroma:latest
+    image: chromadb/chroma:1.5.9
     ports:
       - "${CHROMA_BIND_PORT}:8000"
     environment:
@@ -36,7 +36,7 @@ services:
     restart: unless-stopped
 
   openwebui:
-    image: ghcr.io/open-webui/open-webui:main
+    image: ghcr.io/open-webui/open-webui:v0.11.2
     depends_on:
       - postgres
       - vector-db
@@ -46,6 +46,8 @@ services:
       - open_webui_data:/app/backend/data
     environment:
       - DATABASE_URL=${OPENWEBUI_DATABASE_URL}
+      # fixed signing key: without it every restart invalidates all sessions
+      - WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY}
       - ENABLE_PERSISTENT_CONFIG=${OPENWEBUI_ENABLE_PERSISTENT_CONFIG}
 
       - VECTOR_DB=chroma
