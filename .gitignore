@@ -5,3 +5,4 @@ node_modules/
 *.log
 system-prompt.md
 dist/
+HANDOFF.md

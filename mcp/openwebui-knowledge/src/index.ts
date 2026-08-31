@@ -16,6 +16,13 @@ const DEFAULT_COLLECTION = process.env.OPENWEBUI_DEFAULT_COLLECTION ?? "";
 const HTTP_TIMEOUT_MS = Number(process.env.OPENWEBUI_TIMEOUT_MS ?? "20000");
 const DEBUG = process.env.MCP_DEBUG === "1";
 
+/**
+ * Similarity floor for search hits. OpenWebUI applies its own RELEVANCE_THRESHOLD
+ * only on the hybrid path, so filtering happens here. Recalibrate after changing
+ * the embedding model or chunk size — the scale moves with them.
+ */
+const MIN_SCORE = Number(process.env.OPENWEBUI_MIN_SCORE ?? "0.76");
+
 // OpenWebUI paginates knowledge and file listings server-side at a fixed size.
 const PAGE_ITEM_COUNT = 30;
 
@@ -454,6 +461,7 @@ function createMcpServer(): McpServer {
                 collections: z.array(z.string().min(1)).min(1).max(10).optional(),
                 k: z.number().int().min(1).max(30).optional(),
                 hybrid: z.boolean().optional(),
+                min_score: z.number().min(0).max(1).optional(),
             },
         },
         guard(
@@ -463,23 +471,37 @@ function createMcpServer(): McpServer {
                 collections,
                 k,
                 hybrid,
+                min_score,
             }: {
                 query: string;
                 collection?: string;
                 collections?: string[];
                 k?: number;
                 hybrid?: boolean;
+                min_score?: number;
             }) => {
                 const refs = collections?.length ? collections : [collection ?? ""];
                 const ids = await mapLimit(refs, 4, (ref) => resolveCollection(ref || undefined));
 
-                const results = await searchCollections(ids, query, k ?? 8, hybrid ?? true);
+                // Off by default: the hybrid path re-embeds every candidate per query.
+                const found = await searchCollections(ids, query, k ?? 8, hybrid ?? false);
+                const floor = min_score ?? MIN_SCORE;
+                const results = found.filter((r) => (r.distance ?? 0) >= floor);
 
                 return ok({
                     ok: true,
                     collections: ids,
                     query,
+                    min_score: floor,
                     count: results.length,
+                    ...(results.length === 0 && found.length > 0
+                        ? {
+                              nothing_above_threshold: true,
+                              best_score_seen: Math.max(...found.map((r) => r.distance ?? 0)),
+                              hint: "Nothing relevant enough in this collection — say so instead of "
+                                  + "answering from the chunks.",
+                          }
+                        : {}),
                     results,
                 });
             }
