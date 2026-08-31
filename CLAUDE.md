@@ -128,6 +128,16 @@ regardless of collection size. What size costs is competition: near-duplicate
 documents crowd each other out of those few slots. Split collections by role and
 keep artifacts atomic.
 
+**Identical chunks collapse into one result.** OpenWebUI keys retrieved chunks by
+a hash of their text (`merge_and_sort_query_results`), so byte-identical chunks in
+different documents count as a single hit. Repeated boilerplate that lands in its
+own chunk — a per-artifact provenance header, a shared preamble — therefore eats
+the result set: a query whose nearest neighbours are those chunks comes back with
+one row instead of `top_k`, and the real answers never surface. Nothing errors;
+the response is just short. Keep boilerplate out of its own chunk, and when recall
+on a collection looks arbitrary, compare its chunk count against its *distinct*
+chunk count.
+
 **The default embedding model is English-only** with a 256-token limit. Non-Latin
 text tokenises far worse, so a chunk sized for English is silently truncated
 mid-way. Check `max_seq_length` against your own corpus before trusting recall.
