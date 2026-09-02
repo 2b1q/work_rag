@@ -56,6 +56,11 @@ services:
       - CHROMA_TENANT=default_tenant
       - CHROMA_DATABASE=default_database
 
+      # multilingual, 1024d. Persistent config already holds it; pinning it here
+      # too means a deploy without that config cannot silently fall back to the
+      # image default (English, 384d) and fail every write on the dimension.
+      - RAG_EMBEDDING_MODEL=BAAI/bge-m3
+
       - OPENAI_API_BASE_URL=${UPSTREAM_OPENAI_BASE_URL}
       - OPENAI_API_KEY=${UPSTREAM_OPENAI_API_KEY}
 

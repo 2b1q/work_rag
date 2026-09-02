@@ -65,7 +65,17 @@ copying is a session-close skill that (1) writes findings into their real homes,
   upgrade should be a decision, not a side effect of `docker compose pull`.
 - **Never commit `.env`**, and never echo a key into output that lands in a
   commit, an issue, or a README.
-- Node comments, identifiers and log messages in English.
+- **The repo is English, end to end.** Code, comments, identifiers, log messages,
+  docs and the local notes beside them. The corpus this stack indexes is Russian;
+  the repo that serves it is not. Reproduce a non-English string only when it has
+  to be verbatim — a probe query, a sample chunk — and quote it as data rather
+  than writing prose around it. One deliberate exception: `prompts/` holds a
+  runtime artifact, not source, and is written in the operator's language — leave
+  it alone. `polymarket/` is a separate project that happens to sit in this
+  directory; it is gitignored and out of scope.
+- **No employer or client identifiers.** This is a personal stack; keep work
+  project names, internal repo names and team vocabulary out of it, including
+  commit messages. The knowledge collections are where that material lives.
 - After editing the server: `npx tsc -p tsconfig.json`, then
   `docker compose up -d --build openwebui-knowledge`. The image must match source.
 
@@ -123,6 +133,17 @@ irrelevant. That is why the MCP server filters by `MIN_SCORE` itself. The two
 paths also score on different scales — a threshold measured on one will misfire
 on the other.
 
+**A score floor belongs to the corpus, not to the stack.** `MIN_SCORE` is set by
+probing one collection — score a batch of relevant queries and a batch of
+unrelated ones, then put the floor in the gap between the two bands. Those bands
+move when the material changes. Conversational or distilled text — chat exports,
+transcripts, meeting notes — scores systematically lower against a well-formed
+question than curated prose does, because it is not written like an answer to
+one. Carry a floor across that boundary and the collection returns almost
+nothing, which reads exactly like a broken ingestion pipeline and sends you to
+debug the wrong thing. Calibrate per collection on a sample, and pass `min_score`
+in the call rather than moving the default.
+
 **Corpus size does not bloat the context.** Retrieval injects `top_k × chunk_size`
 regardless of collection size. What size costs is competition: near-duplicate
 documents crowd each other out of those few slots. Split collections by role and
@@ -141,3 +162,6 @@ chunk count.
 **The default embedding model is English-only** with a 256-token limit. Non-Latin
 text tokenises far worse, so a chunk sized for English is silently truncated
 mid-way. Check `max_seq_length` against your own corpus before trusting recall.
+This stack therefore pins a multilingual model in `docker-compose.yaml` as well as
+in persistent config: the pin is what stops a deploy without that config from
+falling back to the default and failing every write on the dimension mismatch.
