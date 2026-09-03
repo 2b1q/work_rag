@@ -50,8 +50,8 @@ claude mcp add --scope user --transport http openwebui-knowledge http://localhos
 None in this repo — the stack is infrastructure, and the routines that use it
 belong to the repos whose documents live in the collections. The pattern worth
 copying is a session-close skill that (1) writes findings into their real homes,
-(2) regenerates a short digest, (3) syncs changed documents. A working example:
-[ai-nomad `kb-sync`](https://github.com/2b1q/ai-nomad).
+(2) regenerates a short digest, (3) syncs changed documents. It lives in the
+consumer repo that owns the collection, not here.
 
 ## Rules of engagement
 

@@ -107,7 +107,7 @@ HTTP+SSE transport on `/sse` for older clients.
 
 ## MCP tools
 
-Every tool takes `collection` as either an id or a **name** — `"AI-NOMAD"` works
+Every tool takes `collection` as either an id or a **name** — `"JIRA"` works
 as well as the uuid, which matters because a model can produce a name and cannot
 guess a uuid.
 
@@ -122,8 +122,8 @@ guess a uuid.
 
 ```
 run mcp**openwebui-knowledge**search_knowledge {
-  "collection": "AI-NOMAD",
-  "query": "how does the rover avoid low obstacles",
+  "collection": "JIRA",
+  "query": "incidents where pods crashed with OOM",
   "k": 8
 }
 ```
@@ -149,9 +149,9 @@ queried on purpose — keeps each one's slots to itself.
 chunks that straddle two unrelated topics. Cut it along the structure it already
 has — one section, one issue, one entry per artifact.
 
-`ai-nomad` uses [a sync tool](https://github.com/2b1q/ai-nomad) built on this
-idea: it splits its logs by heading and by dated row, hashes every artifact, and
-uploads only what changed.
+A consumer repo of this stack uses a sync tool built on this idea: it splits its
+logs by heading and by dated row, hashes every artifact, and uploads only what
+changed.
 
 ## Retrieval settings that matter
 
