@@ -33,6 +33,7 @@ services:
       - OPENWEBUI_API_KEY=${OPENWEBUI_API_KEY}
       # (optional) specify a default collection to sync with, otherwise it will sync with the default collection of the OpenWebUI instance  
       - OPENWEBUI_DEFAULT_COLLECTION=${OPENWEBUI_DEFAULT_COLLECTION}
+      - OPENWEBUI_MIN_SCORE=0.77
     restart: unless-stopped
 
   openwebui:
