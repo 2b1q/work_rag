@@ -26,6 +26,11 @@ const MIN_SCORE = Number(process.env.OPENWEBUI_MIN_SCORE ?? "0.76");
 // OpenWebUI paginates knowledge and file listings server-side at a fixed size.
 const PAGE_ITEM_COUNT = 30;
 
+// Extraction and embedding run in a background task after an upload. How long
+// upload_document waits for that to finish before returning settled:false.
+const UPLOAD_SETTLE_MS = Number(process.env.OPENWEBUI_UPLOAD_SETTLE_MS ?? "60000");
+const UPLOAD_POLL_MS = 2000;
+
 if (!OPENWEBUI_API_KEY) {
     throw new Error("OPENWEBUI_API_KEY is required");
 }
@@ -506,6 +511,148 @@ function createMcpServer(): McpServer {
                 });
             }
         )
+    );
+
+
+    /* -------------------------------------------------------------- *
+     * Write side. Creating a collection and putting documents in it.
+     * -------------------------------------------------------------- */
+
+    mcp.registerTool(
+        "create_collection",
+        {
+            description:
+                "Create a knowledge collection. Returns its id. If a collection with the same name already " +
+                "exists the existing one is returned untouched, so this is safe to call again.",
+            inputSchema: {
+                name: z.string().min(1),
+                description: z.string().optional(),
+            },
+        },
+        guard(async ({ name, description }: { name: string; description?: string }) => {
+            const existing = await listKnowledge(1, name).catch(() => null);
+            const hit = (existing?.items ?? []).find(
+                (k) => (k.name ?? "").toLowerCase() === name.trim().toLowerCase()
+            );
+            if (hit) return ok({ ok: true, created: false, id: hit.id, name: hit.name, description: hit.description });
+
+            const made = await postJson<KnowledgeItem>("/api/v1/knowledge/create", {
+                name,
+                description: description ?? "",
+            });
+            return ok({ ok: true, created: true, id: made.id, name: made.name, description: made.description });
+        })
+    );
+
+    mcp.registerTool(
+        "upload_document",
+        {
+            description:
+                "Put a text document into a knowledge collection: uploads the content as a file and attaches it. " +
+                "`collection` accepts an id or a name; defaults to OPENWEBUI_DEFAULT_COLLECTION. " +
+                "Set `replace` to drop any file already in the collection with the same filename, which is what " +
+                "you want when re-syncing a document that changed. Waits for embedding to finish; " +
+                "`settled: false` means it is still running in the background, not that it failed.",
+            inputSchema: {
+                filename: z.string().min(1),
+                content: z.string().min(1),
+                collection: z.string().optional(),
+                replace: z.boolean().optional(),
+            },
+        },
+        guard(
+            async ({
+                filename,
+                content,
+                collection,
+                replace,
+            }: {
+                filename: string;
+                content: string;
+                collection?: string;
+                replace?: boolean;
+            }) => {
+                const collectionId = await resolveCollection(collection);
+                const removed: string[] = [];
+
+                if (replace) {
+                    const current = await listKnowledgeFiles(collectionId, 1, filename).catch(() => null);
+                    for (const f of current?.items ?? []) {
+                        if (fileName(f) === filename) {
+                            await postJson(`/api/v1/knowledge/${encodeURIComponent(collectionId)}/file/remove`, {
+                                file_id: f.id,
+                            }).catch(() => {});
+                            removed.push(f.id);
+                        }
+                    }
+                }
+
+                // One pass: metadata.knowledge_id makes OpenWebUI embed straight into the
+                // collection and link the file itself. Uploading and then calling
+                // knowledge/{id}/file/add races extraction, which fails the add with an
+                // "content is empty" error that reads like a corrupt file.
+                const form = new FormData();
+                form.append("file", new Blob([content], { type: "text/markdown" }), filename);
+                // A plain form field, not a Blob — a Blob part arrives as an upload and the
+                // endpoint rejects it (metadata is declared Form(dict | str)).
+                form.append("metadata", JSON.stringify({ knowledge_id: collectionId }));
+
+                // Multipart: fetch sets its own boundary, so the JSON Content-Type from headers() must not leak in.
+                const uploadRes = await fetch(`${OPENWEBUI_BASE_URL}/api/v1/files/`, {
+                    method: "POST",
+                    headers: { Authorization: `Bearer ${OPENWEBUI_API_KEY}`, Accept: "application/json" },
+                    body: form,
+                    signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
+                });
+                if (!uploadRes.ok) {
+                    const body = await uploadRes.text().catch(() => "");
+                    throw new OpenWebUIError(uploadRes.status, `${OPENWEBUI_BASE_URL}/api/v1/files/`, body);
+                }
+                const file = (await uploadRes.json()) as FileItem;
+
+                // Embedding is asynchronous, so a caller that returns immediately cannot tell
+                // a queued document from a finished one. Wait for the collection to stop
+                // listing this file as pending; settled:false means still working, not failed.
+                const pendingPath = `/api/v1/knowledge/${encodeURIComponent(collectionId)}/files/pending`;
+                const deadline = Date.now() + UPLOAD_SETTLE_MS;
+                let settled = false;
+                while (Date.now() < deadline) {
+                    const pending = await getJson<FileItem[]>(pendingPath).catch(() => [] as FileItem[]);
+                    if (!pending.some((f) => f.id === file.id)) {
+                        settled = true;
+                        break;
+                    }
+                    await new Promise((r) => setTimeout(r, UPLOAD_POLL_MS));
+                }
+
+                return ok({
+                    ok: true,
+                    collection: collectionId,
+                    file_id: file.id,
+                    filename,
+                    bytes: content.length,
+                    replaced: removed,
+                    settled,
+                });
+            }
+        )
+    );
+
+    mcp.registerTool(
+        "remove_document",
+        {
+            description:
+                "Detach a file from a knowledge collection by file_id. The file itself stays in OpenWebUI.",
+            inputSchema: {
+                file_id: z.string().min(1),
+                collection: z.string().optional(),
+            },
+        },
+        guard(async ({ file_id, collection }: { file_id: string; collection?: string }) => {
+            const collectionId = await resolveCollection(collection);
+            await postJson(`/api/v1/knowledge/${encodeURIComponent(collectionId)}/file/remove`, { file_id });
+            return ok({ ok: true, collection: collectionId, file_id, removed: true });
+        })
     );
 
     return mcp;

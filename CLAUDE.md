@@ -28,11 +28,13 @@ belong to OpenWebUI; going around it would fork the ranking behaviour.
 | [mcp/openwebui-knowledge/src/index.ts](mcp/openwebui-knowledge/src/index.ts) | the whole MCP server, single file |
 | [prompts/](prompts/) | system prompt used in the OpenWebUI chat UI |
 | `.env` | credentials and per-deployment settings — gitignored, see `.env.example` |
+| [tools/githooks/pre-commit](tools/githooks/pre-commit) | sanitization gate; private terms go in gitignored `.sanitize-deny` |
 
 ## MCP tools
 
-`ping_openwebui` · `list_collections` · `list_documents` · `get_document` ·
+Read: `ping_openwebui` · `list_collections` · `list_documents` · `get_document` ·
 `select_context_files` · `search_knowledge`.
+Write: `create_collection` · `upload_document` · `remove_document`.
 
 `collection` accepts an id **or a name** — a model can produce a name and cannot
 guess a uuid. `search_knowledge` filters by `min_score` (see below) and takes
@@ -73,6 +75,10 @@ consumer repo that owns the collection, not here.
   runtime artifact, not source, and is written in the operator's language — leave
   it alone. `polymarket/` is a separate project that happens to sit in this
   directory; it is gitignored and out of scope.
+- **The sanitization hook is not optional.** `git config core.hooksPath
+  tools/githooks` once per clone; it refuses a commit carrying credentials,
+  Cyrillic or a denylisted term. Keep the private terms in `.sanitize-deny`,
+  never in the hook — a denylist in a public repo publishes what it hides.
 - **No employer or client identifiers.** This is a personal stack; keep work
   project names, internal repo names and team vocabulary out of it, including
   commit messages. The knowledge collections are where that material lives.
@@ -115,13 +121,18 @@ collection has to be dropped and refilled. A Chroma major upgrade can likewise
 leave the old data unreadable — the documents survive in Postgres, so
 `POST /api/v1/knowledge/reindex` rebuilds the vectors.
 
-**Uploading twice is the default mistake.** `POST /api/v1/files/` followed by
-`knowledge/{id}/file/add` embeds the same text twice — once into the file's own
-store, once into the collection's. Pass `metadata={"knowledge_id": ...}` on
-upload instead: one pass, and the link is made for you. Processing then runs in a
-background task, so poll `knowledge/{id}/files/pending`; attaching before
-extraction finishes fails with an "empty content" error that reads like a corrupt
-file.
+**Attach on upload, never in a second call.** `POST /api/v1/files/` followed by
+`knowledge/{id}/file/add` loses a race it gives no hint of: extraction runs in a
+background task, the upload returns while it is still going, and the add then
+rejects the file with "The content provided is empty" — which reads like a corrupt
+document rather than a timing bug. Pass `metadata={"knowledge_id": ...}` on the
+upload instead and OpenWebUI embeds into the collection and links the file itself,
+with nothing to race. Send `metadata` as a plain form field: a multipart part with
+its own content type arrives as an upload and is rejected. Embedding is still
+asynchronous either way, so poll `knowledge/{id}/files/pending` before treating the
+document as searchable. Both routes write the file's own `file-{id}` store as well
+as the collection's, so neither saves an embedding pass — the difference is the
+race, not the cost.
 
 **Retrieval settings do not behave as their names suggest.**
 `ENABLE_RAG_HYBRID_SEARCH` defaults to off, and while it is off the API silently

@@ -6,3 +6,5 @@ node_modules/
 system-prompt.md
 dist/
 HANDOFF.md
+*.bak
+.sanitize-deny

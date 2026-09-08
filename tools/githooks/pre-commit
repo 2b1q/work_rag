@@ -1,0 +1,67 @@
+#!/bin/sh
+# Refuse a commit that would publish credentials or private material.
+# This repo is public: anything staged here becomes readable by anyone, and a
+# push cannot be taken back — history keeps the blob even after a later fix.
+#
+# Install once:  git config core.hooksPath tools/githooks
+# Bypass once:   git commit --no-verify
+#
+# Repo-specific terms (collection names, private repos, employers) go in
+# .sanitize-deny, one per line. That file is gitignored on purpose: a denylist
+# of private names, committed to a public repo, publishes the very names.
+
+set -u
+
+STAGED=$(git diff --cached --name-only --diff-filter=ACMR)
+[ -n "$STAGED" ] || exit 0
+
+# Added lines only: existing content is not this commit's problem.
+ADDED=$(git diff --cached --unified=0 --diff-filter=ACMR -- $STAGED | grep '^+' | grep -v '^+++')
+
+fail=0
+report() {
+    if [ "$fail" -eq 0 ]; then
+        printf '\npre-commit: refusing to commit — sanitization failed\n' >&2
+        fail=1
+    fi
+    printf '\n  %s\n' "$1" >&2
+    [ -n "${2:-}" ] && printf '%s\n' "$2" | sed 's/^/      /' >&2
+    return 0
+}
+
+# 1. Environment files never belong in the repo; .env.example is the exception.
+ENVS=$(printf '%s\n' "$STAGED" | grep -E '(^|/)\.env($|\.)' | grep -v '\.env\.example$' || true)
+[ -n "$ENVS" ] && report "environment file staged:" "$ENVS"
+
+# 2. Credential shapes. Ordered by how often each one actually shows up.
+CREDS='sk-[A-Za-z0-9_-]{16,}|(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{16,}|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.|-----BEGIN [A-Z ]*PRIVATE KEY-----'
+HITS=$(printf '%s\n' "$ADDED" | grep -aoE "$CREDS" | sort -u | cut -c1-12 | sed 's/$/…/' || true)
+[ -n "$HITS" ] && report "credential-shaped string in added lines:" "$HITS"
+
+# A quoted assignment to a secret-sounding name, long enough to be a real value.
+ASSIGN=$(printf '%s\n' "$ADDED" | grep -aiEo "(password|passwd|secret|token|api_?key|access_?key|client_?secret)[[:space:]]*[:=][[:space:]]*['\"][^'\"]{12,}['\"]" | sort -u | cut -c1-40 || true)
+[ -n "$ASSIGN" ] && report "secret-looking assignment in added lines:" "$ASSIGN"
+
+# 3. The repo is English end to end; Cyrillic marks pasted private material.
+# 208-211 are the UTF-8 lead bytes for U+0400-U+04FF. Built with sprintf because
+# \xNN in a pattern is not portable across grep implementations, and matching
+# every non-ASCII byte would flag the em-dashes the docs are full of.
+CYR=$(printf '%s\n' "$ADDED" | LC_ALL=C awk 'BEGIN{p=sprintf("[%c-%c]",208,211)} $0 ~ p {n++} END{print n+0}')
+[ "${CYR:-0}" -gt 0 ] && report "Cyrillic in added lines ($CYR line(s)) — the repo is English"
+
+# 4. Local denylist, if the developer keeps one.
+DENY="$(git rev-parse --show-toplevel)/.sanitize-deny"
+if [ -f "$DENY" ]; then
+    while IFS= read -r term; do
+        case "$term" in ''|'#'*) continue ;; esac
+        if printf '%s\n' "$ADDED" | grep -aqiF -- "$term"; then
+            report "denylisted term in added lines: $term"
+        fi
+    done < "$DENY"
+fi
+
+if [ "$fail" -ne 0 ]; then
+    printf '\n  Fix the staged content, or bypass knowingly with --no-verify.\n\n' >&2
+    exit 1
+fi
+exit 0
