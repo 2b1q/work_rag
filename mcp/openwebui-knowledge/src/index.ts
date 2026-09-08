@@ -630,7 +630,9 @@ function createMcpServer(): McpServer {
                     collection: collectionId,
                     file_id: file.id,
                     filename,
-                    bytes: content.length,
+                    // Characters, not bytes: Cyrillic is two UTF-8 bytes apiece, so this reads well
+                    // below the stored size. list_documents reports the real byte count.
+                    chars: content.length,
                     replaced: removed,
                     settled,
                 });
