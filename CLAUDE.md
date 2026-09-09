@@ -34,7 +34,9 @@ belong to OpenWebUI; going around it would fork the ranking behaviour.
 
 Read: `ping_openwebui` · `list_collections` · `list_documents` · `get_document` ·
 `select_context_files` · `search_knowledge`.
-Write: `create_collection` · `upload_document` · `remove_document`.
+Write: `create_collection` · `upload_document` · `upload_document_from_path` ·
+`remove_document`. The path variant reads only under `OPENWEBUI_UPLOAD_ROOTS`,
+which is empty by default and refuses every path.
 
 `collection` accepts an id **or a name** — a model can produce a name and cannot
 guess a uuid. `search_knowledge` filters by `min_score` (see below) and takes
@@ -133,6 +135,16 @@ asynchronous either way, so poll `knowledge/{id}/files/pending` before treating 
 document as searchable. Both routes write the file's own `file-{id}` store as well
 as the collection's, so neither saves an embedding pass — the difference is the
 race, not the cost.
+
+**A file joins its collection only after it is embedded.** OpenWebUI runs
+extraction and embedding first and calls `add_file_to_knowledge_by_id` last, so
+between the upload and the end of the queue the document is in no listing and in
+no search result. Nothing is stale and nothing is lost — the file simply is not a
+member yet. Read `knowledge/{id}/files/pending` to see it, and treat "absent from
+both" as the only real absence. The trap is that a listing taken in that window
+looks authoritative and is merely early; a caller that retries on it uploads the
+document a second time. It also means a replacement cannot be detached until its
+successor is linked, or the collection spends the whole embedding window empty.
 
 **Retrieval settings do not behave as their names suggest.**
 `ENABLE_RAG_HYBRID_SEARCH` defaults to off, and while it is off the API silently

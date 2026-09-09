@@ -1,5 +1,8 @@
+import { createHash } from "node:crypto";
+import { readFile, realpath, stat } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { basename, sep } from "node:path";
 
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -27,9 +30,24 @@ const MIN_SCORE = Number(process.env.OPENWEBUI_MIN_SCORE ?? "0.76");
 const PAGE_ITEM_COUNT = 30;
 
 // Extraction and embedding run in a background task after an upload. How long
-// upload_document waits for that to finish before returning settled:false.
+// the upload tools wait for that to finish before reporting settled:false.
 const UPLOAD_SETTLE_MS = Number(process.env.OPENWEBUI_UPLOAD_SETTLE_MS ?? "60000");
 const UPLOAD_POLL_MS = 2000;
+
+/**
+ * Directories `upload_document_from_path` may read, colon-separated. A path
+ * parameter otherwise means "put any file on this machine into the knowledge
+ * base", so the default is empty and every path is refused until the owner
+ * lists roots explicitly.
+ */
+const UPLOAD_ROOTS = (process.env.OPENWEBUI_UPLOAD_ROOTS ?? "")
+    .split(":")
+    .map((r) => r.trim())
+    .filter(Boolean);
+
+// A path upload reads the whole file into memory twice (buffer, then Blob), so
+// one oversized file would otherwise take the server down with it.
+const UPLOAD_MAX_BYTES = Number(process.env.OPENWEBUI_UPLOAD_MAX_BYTES ?? "33554432");
 
 if (!OPENWEBUI_API_KEY) {
     throw new Error("OPENWEBUI_API_KEY is required");
@@ -106,6 +124,8 @@ type KnowledgeItem = {
 type FileItem = {
     id: string;
     filename?: string;
+    // sha256 of the uploaded bytes, computed by OpenWebUI on upload.
+    hash?: string;
     meta?: { name?: string; size?: number; content_type?: string };
     created_at?: number;
     updated_at?: number;
@@ -170,6 +190,165 @@ async function getFileWithContent(fileId: string): Promise<{ file: FileDetail | 
 
 function fileName(f: FileItem): string | undefined {
     return f.meta?.name ?? f.filename;
+}
+
+/** Files still being extracted and embedded. They are not linked to the collection yet. */
+function pendingFiles(collectionId: string): Promise<FileItem[]> {
+    return getJson(`/api/v1/knowledge/${encodeURIComponent(collectionId)}/files/pending`);
+}
+
+/** Every file in the collection carrying exactly this name, across all pages. */
+async function filesNamed(collectionId: string, filename: string): Promise<FileItem[]> {
+    const found: FileItem[] = [];
+    for (let page = 1; ; page++) {
+        const { items, total } = await listKnowledgeFiles(collectionId, page, filename);
+        found.push(...items.filter((f) => fileName(f) === filename));
+        if (items.length === 0 || page * PAGE_ITEM_COUNT >= total) return found;
+    }
+}
+
+export type PathRefusal = "no_roots" | "not_found" | "not_a_file" | "outside_roots" | "too_large";
+
+/** Carries a code the caller can branch on, not just prose. */
+export class UploadPathError extends Error {
+    constructor(readonly reason: PathRefusal, detail: string) {
+        super(`${reason}: ${detail}`);
+        this.name = "UploadPathError";
+    }
+}
+
+// A symlinked root has to be compared against its real path, so resolve once.
+let rootsOnce: Promise<string[]> | null = null;
+function uploadRoots(): Promise<string[]> {
+    rootsOnce ??= Promise.all(UPLOAD_ROOTS.map((r) => realpath(r).catch(() => r)));
+    return rootsOnce;
+}
+
+/**
+ * Resolves a caller-supplied path and refuses anything outside the allowlist.
+ * realpath first, compare second — checking the raw string lets `..` and a
+ * symlink walk straight out of the allowed roots.
+ */
+export async function resolveUploadPath(input: string): Promise<string> {
+    if (UPLOAD_ROOTS.length === 0) {
+        throw new UploadPathError(
+            "no_roots",
+            "path uploads are disabled; set OPENWEBUI_UPLOAD_ROOTS to the directories the server may read"
+        );
+    }
+
+    let real: string;
+    try {
+        real = await realpath(input);
+    } catch {
+        throw new UploadPathError("not_found", input);
+    }
+
+    const roots = await uploadRoots();
+    const inside = roots.some((root) => real === root || real.startsWith(root.endsWith(sep) ? root : root + sep));
+    if (!inside) throw new UploadPathError("outside_roots", real);
+
+    const info = await stat(real);
+    if (!info.isFile()) throw new UploadPathError("not_a_file", real);
+    if (info.size > UPLOAD_MAX_BYTES) {
+        throw new UploadPathError("too_large", `${real} is ${info.size} bytes, over OPENWEBUI_UPLOAD_MAX_BYTES`);
+    }
+    return real;
+}
+
+/** Uploads bytes and lets OpenWebUI link them itself; see the note in putDocument. */
+async function uploadIntoCollection(collectionId: string, filename: string, body: Uint8Array): Promise<FileItem> {
+    const form = new FormData();
+    // Copied into a fresh view: a Buffer is backed by ArrayBufferLike, which is not a BlobPart.
+    form.append("file", new Blob([new Uint8Array(body)], { type: "text/markdown" }), filename);
+    // A plain form field, not a Blob — a Blob part arrives as an upload and the
+    // endpoint rejects it (metadata is declared Form(dict | str)).
+    form.append("metadata", JSON.stringify({ knowledge_id: collectionId }));
+
+    // Multipart: fetch sets its own boundary, so the JSON Content-Type from headers() must not leak in.
+    const url = `${OPENWEBUI_BASE_URL}/api/v1/files/`;
+    const res = await fetch(url, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${OPENWEBUI_API_KEY}`, Accept: "application/json" },
+        body: form,
+        signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
+    });
+    if (!res.ok) throw new OpenWebUIError(res.status, url, await res.text().catch(() => ""));
+    return (await res.json()) as FileItem;
+}
+
+/** Resolves true once the file is linked, false once the budget runs out. */
+async function waitForLink(collectionId: string, fileId: string, filename: string, budgetMs: number): Promise<boolean> {
+    const deadline = Date.now() + budgetMs;
+    for (;;) {
+        const linked = await filesNamed(collectionId, filename).catch(() => [] as FileItem[]);
+        if (linked.some((f) => f.id === fileId)) return true;
+        if (Date.now() >= deadline) return false;
+        await new Promise((r) => setTimeout(r, UPLOAD_POLL_MS));
+    }
+}
+
+type PutResult = {
+    file_id: string;
+    filename: string;
+    bytes: number;
+    replaced: string[];
+    detach_failed: string[];
+    settled: boolean;
+    unchanged: boolean;
+};
+
+/**
+ * The single write path behind both upload tools.
+ *
+ * Two orderings matter here. `metadata.knowledge_id` makes OpenWebUI embed into
+ * the collection and link the file itself, which avoids the race a separate
+ * `file/add` loses. And OpenWebUI links only *after* embedding, so a replacement
+ * can be detached only once the new file is linked — otherwise the collection
+ * spends the embedding window with no copy of the document at all. A replace
+ * therefore waits, and on timeout keeps the old version and reports nothing
+ * replaced.
+ */
+async function putDocument(args: {
+    collectionId: string;
+    filename: string;
+    body: Uint8Array;
+    replace: boolean;
+    waitMs: number;
+}): Promise<PutResult> {
+    const { collectionId, filename, body, replace, waitMs } = args;
+    const bytes = body.byteLength;
+    const digest = createHash("sha256").update(body).digest("hex");
+    const existing = await filesNamed(collectionId, filename);
+
+    // OpenWebUI refuses to attach a byte-identical file anyway; matching its own
+    // sha256 turns that refusal into a plain no-op the caller can read.
+    const identical = existing.find((f) => f.hash === digest);
+    if (identical) {
+        return { file_id: identical.id, filename, bytes, replaced: [], detach_failed: [], settled: true, unchanged: true };
+    }
+
+    const file = await uploadIntoCollection(collectionId, filename, body);
+
+    // A replace has to wait, so callers pass a positive budget for it; see the tools.
+    const settled = waitMs > 0 ? await waitForLink(collectionId, file.id, filename, waitMs) : false;
+
+    const replaced: string[] = [];
+    const detach_failed: string[] = [];
+    if (replace && settled) {
+        for (const old of existing) {
+            // Record only what actually came off. Reporting a failed detach as done
+            // tells the caller the old copy is gone while it is still being searched.
+            const gone = await postJson(`/api/v1/knowledge/${encodeURIComponent(collectionId)}/file/remove`, {
+                file_id: old.id,
+            })
+                .then(() => true)
+                .catch(() => false);
+            (gone ? replaced : detach_failed).push(old.id);
+        }
+    }
+
+    return { file_id: file.id, filename, bytes, replaced, detach_failed, settled, unchanged: false };
 }
 
 /**
@@ -277,7 +456,7 @@ function paging(page: number, total: number) {
 }
 
 function createMcpServer(): McpServer {
-    const mcp = new McpServer({ name: "openwebui-knowledge", version: "1.0.0" });
+    const mcp = new McpServer({ name: "openwebui-knowledge", version: "1.1.0" });
 
     mcp.registerTool(
         "ping_openwebui",
@@ -331,7 +510,9 @@ function createMcpServer(): McpServer {
         {
             description:
                 "List files inside a knowledge collection. `collection` accepts an id or a name; " +
-                "defaults to OPENWEBUI_DEFAULT_COLLECTION. Optional `query` filters by filename.",
+                "defaults to OPENWEBUI_DEFAULT_COLLECTION. Optional `query` filters by filename. " +
+                "`pending` lists files still being embedded: they are not in `files` yet and are not " +
+                "searchable, but they are not lost either.",
             inputSchema: {
                 collection: z.string().optional(),
                 query: z.string().optional(),
@@ -341,7 +522,10 @@ function createMcpServer(): McpServer {
         guard(async ({ collection, query, page }: { collection?: string; query?: string; page?: number }) => {
             const id = await resolveCollection(collection);
             const p = page ?? 1;
-            const { items, total } = await listKnowledgeFiles(id, p, query);
+            const [{ items, total }, pending] = await Promise.all([
+                listKnowledgeFiles(id, p, query),
+                pendingFiles(id).catch(() => [] as FileItem[]),
+            ]);
 
             return ok({
                 ok: true,
@@ -352,6 +536,10 @@ function createMcpServer(): McpServer {
                     name: fileName(f),
                     size: f.meta?.size,
                 })),
+                // OpenWebUI links a file only after its embedding finishes, so `files`
+                // is accurate but not yet complete. These are on the way in; a document
+                // missing from both lists is genuinely absent.
+                pending: pending.map((f) => ({ file_id: f.id, name: fileName(f) })),
             });
         })
     );
@@ -551,13 +739,15 @@ function createMcpServer(): McpServer {
                 "Put a text document into a knowledge collection: uploads the content as a file and attaches it. " +
                 "`collection` accepts an id or a name; defaults to OPENWEBUI_DEFAULT_COLLECTION. " +
                 "Set `replace` to drop any file already in the collection with the same filename, which is what " +
-                "you want when re-syncing a document that changed. Waits for embedding to finish; " +
-                "`settled: false` means it is still running in the background, not that it failed.",
+                "you want when re-syncing a document that changed. Returns as soon as the upload is accepted; " +
+                "`settled: false` means embedding is still running in the background, not that it failed. " +
+                "Set `wait` to block until it finishes. Prefer upload_document_from_path when the file is on disk.",
             inputSchema: {
                 filename: z.string().min(1),
                 content: z.string().min(1),
                 collection: z.string().optional(),
                 replace: z.boolean().optional(),
+                wait: z.boolean().optional(),
             },
         },
         guard(
@@ -566,76 +756,93 @@ function createMcpServer(): McpServer {
                 content,
                 collection,
                 replace,
+                wait,
             }: {
                 filename: string;
                 content: string;
                 collection?: string;
                 replace?: boolean;
+                wait?: boolean;
             }) => {
                 const collectionId = await resolveCollection(collection);
-                const removed: string[] = [];
-
-                if (replace) {
-                    const current = await listKnowledgeFiles(collectionId, 1, filename).catch(() => null);
-                    for (const f of current?.items ?? []) {
-                        if (fileName(f) === filename) {
-                            await postJson(`/api/v1/knowledge/${encodeURIComponent(collectionId)}/file/remove`, {
-                                file_id: f.id,
-                            }).catch(() => {});
-                            removed.push(f.id);
-                        }
-                    }
-                }
-
-                // One pass: metadata.knowledge_id makes OpenWebUI embed straight into the
-                // collection and link the file itself. Uploading and then calling
-                // knowledge/{id}/file/add races extraction, which fails the add with an
-                // "content is empty" error that reads like a corrupt file.
-                const form = new FormData();
-                form.append("file", new Blob([content], { type: "text/markdown" }), filename);
-                // A plain form field, not a Blob — a Blob part arrives as an upload and the
-                // endpoint rejects it (metadata is declared Form(dict | str)).
-                form.append("metadata", JSON.stringify({ knowledge_id: collectionId }));
-
-                // Multipart: fetch sets its own boundary, so the JSON Content-Type from headers() must not leak in.
-                const uploadRes = await fetch(`${OPENWEBUI_BASE_URL}/api/v1/files/`, {
-                    method: "POST",
-                    headers: { Authorization: `Bearer ${OPENWEBUI_API_KEY}`, Accept: "application/json" },
-                    body: form,
-                    signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
+                const result = await putDocument({
+                    collectionId,
+                    filename,
+                    body: new TextEncoder().encode(content),
+                    replace: replace ?? false,
+                    // A replace waits whether or not `wait` was asked for: the old version
+                    // is detached only once the new one is linked.
+                    waitMs: wait || replace ? UPLOAD_SETTLE_MS : 0,
                 });
-                if (!uploadRes.ok) {
-                    const body = await uploadRes.text().catch(() => "");
-                    throw new OpenWebUIError(uploadRes.status, `${OPENWEBUI_BASE_URL}/api/v1/files/`, body);
-                }
-                const file = (await uploadRes.json()) as FileItem;
-
-                // Embedding is asynchronous, so a caller that returns immediately cannot tell
-                // a queued document from a finished one. Wait for the collection to stop
-                // listing this file as pending; settled:false means still working, not failed.
-                const pendingPath = `/api/v1/knowledge/${encodeURIComponent(collectionId)}/files/pending`;
-                const deadline = Date.now() + UPLOAD_SETTLE_MS;
-                let settled = false;
-                while (Date.now() < deadline) {
-                    const pending = await getJson<FileItem[]>(pendingPath).catch(() => [] as FileItem[]);
-                    if (!pending.some((f) => f.id === file.id)) {
-                        settled = true;
-                        break;
-                    }
-                    await new Promise((r) => setTimeout(r, UPLOAD_POLL_MS));
-                }
 
                 return ok({
                     ok: true,
                     collection: collectionId,
-                    file_id: file.id,
-                    filename,
+                    file_id: result.file_id,
+                    filename: result.filename,
                     // Characters, not bytes: Cyrillic is two UTF-8 bytes apiece, so this reads well
                     // below the stored size. list_documents reports the real byte count.
                     chars: content.length,
-                    replaced: removed,
-                    settled,
+                    replaced: result.replaced,
+                    settled: result.settled,
                 });
+            }
+        )
+    );
+
+    mcp.registerTool(
+        "upload_document_from_path",
+        {
+            description:
+                "Attach a file the server can read from disk, given its absolute path, so the text never has to " +
+                "travel through the conversation. Reads only under OPENWEBUI_UPLOAD_ROOTS, which is empty by " +
+                "default and refuses every path until the owner lists roots. `filename` defaults to the " +
+                "basename; `collection` takes an id or a name. Returns `unchanged: true` and touches nothing " +
+                "when the collection already holds a byte-identical file of that name. Returns without waiting " +
+                "for embedding unless `wait` is set — `settled: false` is a queue, not a failure, and retrying " +
+                "on it duplicates the document. `replace` waits regardless, because the previous version is " +
+                "detached only once the new one is linked; on timeout the old version stays and `replaced` is " +
+                "empty; anything that did not come off is listed in `detach_failed`. Path refusals carry a code: " +
+                "no_roots, not_found, not_a_file, outside_roots, too_large.",
+            inputSchema: {
+                path: z.string().min(1),
+                collection: z.string().optional(),
+                filename: z.string().optional(),
+                replace: z.boolean().optional(),
+                wait: z.boolean().optional(),
+                timeout_s: z.number().int().min(1).max(900).optional(),
+            },
+        },
+        guard(
+            async ({
+                path,
+                collection,
+                filename,
+                replace,
+                wait,
+                timeout_s,
+            }: {
+                path: string;
+                collection?: string;
+                filename?: string;
+                replace?: boolean;
+                wait?: boolean;
+                timeout_s?: number;
+            }) => {
+                const real = await resolveUploadPath(path);
+                const collectionId = await resolveCollection(collection);
+                const body = await readFile(real);
+                const budgetMs = (timeout_s ?? UPLOAD_SETTLE_MS / 1000) * 1000;
+
+                const result = await putDocument({
+                    collectionId,
+                    filename: filename ?? basename(real),
+                    body,
+                    replace: replace ?? false,
+                    waitMs: wait || replace ? budgetMs : 0,
+                });
+
+                return ok({ ok: true, collection: collectionId, path: real, ...result });
             }
         )
     );
@@ -754,13 +961,17 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse) {
     return sendJson(res, 404, { error: "Not found" });
 }
 
-createServer((req, res) => {
-    handleRequest(req, res).catch((err) => {
-        LOG(`request failed: ${err instanceof Error ? err.message : String(err)}`);
-        sendJson(res, 500, { error: err instanceof Error ? err.message : String(err) });
+// The path allowlist is unit-tested by importing this module, which must not
+// bind the port while doing so.
+if (process.env.MCP_NO_LISTEN !== "1") {
+    createServer((req, res) => {
+        handleRequest(req, res).catch((err) => {
+            LOG(`request failed: ${err instanceof Error ? err.message : String(err)}`);
+            sendJson(res, 500, { error: err instanceof Error ? err.message : String(err) });
+        });
+    }).listen(MCP_PORT, MCP_HOST, () => {
+        LOG(`listening on ${MCP_HOST}:${MCP_PORT} (/mcp streamable, /sse legacy)`);
+        LOG(`upstream ${OPENWEBUI_BASE_URL}`);
+        LOG(`default collection ${DEFAULT_COLLECTION || "(unset)"}`);
     });
-}).listen(MCP_PORT, MCP_HOST, () => {
-    LOG(`listening on ${MCP_HOST}:${MCP_PORT} (/mcp streamable, /sse legacy)`);
-    LOG(`upstream ${OPENWEBUI_BASE_URL}`);
-    LOG(`default collection ${DEFAULT_COLLECTION || "(unset)"}`);
-});
+}

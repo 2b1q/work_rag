@@ -34,6 +34,15 @@ services:
       # (optional) specify a default collection to sync with, otherwise it will sync with the default collection of the OpenWebUI instance  
       - OPENWEBUI_DEFAULT_COLLECTION=${OPENWEBUI_DEFAULT_COLLECTION}
       - OPENWEBUI_MIN_SCORE=0.77
+      # Colon-separated directories upload_document_from_path may read, as seen
+      # from inside this container. Empty by default, which refuses every path:
+      # a path parameter is otherwise "ingest any file the server can reach".
+      # Mount the host directory first — the container cannot see your disk.
+      - OPENWEBUI_UPLOAD_ROOTS=${OPENWEBUI_UPLOAD_ROOTS:-}
+      - OPENWEBUI_UPLOAD_MAX_BYTES=${OPENWEBUI_UPLOAD_MAX_BYTES:-33554432}
+    # Host directories are mounted in docker-compose.override.yaml, which is
+    # gitignored so this file carries nobody's local paths. Compose merges it
+    # automatically.
     restart: unless-stopped
 
   openwebui:

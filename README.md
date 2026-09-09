@@ -119,6 +119,56 @@ guess a uuid.
 | `get_document` | one file's text by `file_id`, clipped to `max_chars` |
 | `select_context_files` | several files concatenated into one context block |
 | `search_knowledge` | semantic search; `collection` or `collections` for several at once |
+| `create_collection` | make a collection, or return the existing one of that name |
+| `upload_document` | put text into a collection, by content |
+| `upload_document_from_path` | the same, but the server reads the file off disk itself |
+| `remove_document` | detach a file from a collection; the file itself stays |
+
+### Writing, and what "done" means
+
+Uploads return as soon as OpenWebUI accepts them. Embedding continues in the
+background, and **a file is linked to its collection only after it finishes** —
+so a freshly uploaded document is briefly in neither `list_documents`' `files`
+nor the search index. That is why `list_documents` also returns `pending`: a
+document in `pending` is on its way in, and one in neither list is genuinely
+absent. `settled: false` on an upload means the same thing. It is not a failure
+and retrying on it uploads the document twice.
+
+`replace: true` is the exception that waits: the previous version is detached
+only once the new one is linked, so the collection is never left without the
+document. If the wait times out the old version stays and `replaced` is empty.
+
+Both upload tools skip work when nothing changed: they compare the file's sha256
+against what the collection already holds and return `unchanged: true` untouched.
+
+### Reading files off disk
+
+`upload_document_from_path` takes a path instead of content, so a large document
+never has to travel through the conversation. A path parameter is otherwise
+"ingest any file this server can reach", so it is gated by an allowlist:
+
+```yaml
+# docker-compose.override.yaml — gitignored, so host paths stay off the repo
+services:
+  openwebui-knowledge:
+    volumes:
+      - /absolute/host/dir:/uploads:ro
+```
+
+```sh
+# .env
+OPENWEBUI_UPLOAD_ROOTS=/uploads
+```
+
+**The default is empty, which refuses every path.** Roots are colon-separated
+and are read *inside the container*, so the directory has to be mounted first.
+Paths are resolved with `realpath` before they are compared, so a symlink or a
+`..` cannot climb out of a root. Refusals carry a code — `no_roots`,
+`not_found`, `not_a_file`, `outside_roots` — and an OpenWebUI failure carries its
+status instead, so the caller can tell them apart.
+
+Deciding *which* files to send stays outside the server: manifests and hash locks
+belong to whatever sync script owns the corpus.
 
 ```
 run mcp**openwebui-knowledge**search_knowledge {
