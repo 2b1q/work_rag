@@ -9,3 +9,4 @@ HANDOFF.md
 *.bak
 .sanitize-deny
 docker-compose.override.yaml
+dumps/

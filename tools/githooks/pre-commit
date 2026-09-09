@@ -33,6 +33,11 @@ report() {
 ENVS=$(printf '%s\n' "$STAGED" | grep -E '(^|/)\.env($|\.)' | grep -v '\.env\.example$' || true)
 [ -n "$ENVS" ] && report "environment file staged:" "$ENVS"
 
+# A database dump carries every credential the application ever stored, so it is
+# refused by name as well as by .gitignore — which `git add -f` walks straight past.
+DUMPS=$(printf '%s\n' "$STAGED" | grep -iE '\.(sql|dump)(\.(gz|bz2|xz|zst))?$|(^|/)dumps?/' || true)
+[ -n "$DUMPS" ] && report "database dump staged:" "$DUMPS"
+
 # 2. Credential shapes. Ordered by how often each one actually shows up.
 CREDS='sk-[A-Za-z0-9_-]{16,}|(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{16,}|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.|-----BEGIN [A-Z ]*PRIVATE KEY-----'
 HITS=$(printf '%s\n' "$ADDED" | grep -aoE "$CREDS" | sort -u | cut -c1-12 | sed 's/$/…/' || true)

@@ -23,7 +23,7 @@ model asks for what it needs when it needs it.
 
 | Component | Role | Version |
 | --- | --- | --- |
-| OpenWebUI | ingestion, retrieval, chat UI, admin | `v0.11.2` |
+| OpenWebUI | ingestion, retrieval, chat UI, admin | `v0.11.3` |
 | ChromaDB | vector storage and similarity search | `1.5.9` |
 | PostgreSQL | collections, file metadata, config, chats | `15` |
 | MCP server | tool interface for Claude (`mcp/openwebui-knowledge`) | local build |

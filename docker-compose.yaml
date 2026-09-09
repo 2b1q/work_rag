@@ -46,7 +46,7 @@ services:
     restart: unless-stopped
 
   openwebui:
-    image: ghcr.io/open-webui/open-webui:v0.11.2
+    image: ghcr.io/open-webui/open-webui:v0.11.3
     depends_on:
       - postgres
       - vector-db
