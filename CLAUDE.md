@@ -33,10 +33,18 @@ belong to OpenWebUI; going around it would fork the ranking behaviour.
 ## MCP tools
 
 Read: `ping_openwebui` · `list_collections` · `list_documents` · `get_document` ·
-`select_context_files` · `search_knowledge`.
+`select_context_files` · `search_knowledge` · `wait_pending`.
 Write: `create_collection` · `upload_document` · `upload_document_from_path` ·
-`remove_document`. The path variant reads only under `OPENWEBUI_UPLOAD_ROOTS`,
-which is empty by default and refuses every path.
+`dedupe_collection` · `remove_document`. The path variant reads only under
+`OPENWEBUI_UPLOAD_ROOTS`, which is empty by default and refuses every path.
+
+A `replace` outlives its own RPC: the tool returns `replace_pending` and a
+background task removes the old version once the new one is linked. That task is
+in memory, not state — a restart loses it and the old version merely stays, which
+is what `dedupe_collection` is for. `wait_pending`'s `settled: true` means the
+queue is empty, not that every replace succeeded; read `replace_done` beside it.
+Blocking tools default to 45 s and cap at 55: an MCP call over a bridge is cut at
+about 60 and the bridge's own overhead takes several seconds of that.
 
 `collection` accepts an id **or a name** — a model can produce a name and cannot
 guess a uuid. `search_knowledge` filters by `min_score` (see below) and takes
@@ -135,6 +143,16 @@ asynchronous either way, so poll `knowledge/{id}/files/pending` before treating 
 document as searchable. Both routes write the file's own `file-{id}` store as well
 as the collection's, so neither saves an embedding pass — the difference is the
 race, not the cost.
+
+**Removing a file from a collection deletes it.** `POST
+/knowledge/{id}/file/remove` takes `delete_file`, defaulted to `not
+ENABLE_KNOWLEDGE_FILE_RETENTION` — and retention is off by default, so the call
+that reads like an unlink also drops the file record and its blob. Retention on
+is the other trap: every superseded version then survives forever, which is how
+`uploads` fills with orphans nothing references. Whichever way it is set, say so
+where the tools are documented — the tool descriptions here promised "the file
+itself stays", and nothing contradicted them until a delete of an
+already-detached file came back 404.
 
 **A file joins its collection only after it is embedded.** OpenWebUI runs
 extraction and embedding first and calls `add_file_to_knowledge_by_id` last, so

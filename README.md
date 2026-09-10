@@ -118,11 +118,20 @@ guess a uuid.
 | `list_documents` | files in a collection, with `total` and `has_more` |
 | `get_document` | one file's text by `file_id`, clipped to `max_chars` |
 | `select_context_files` | several files concatenated into one context block |
-| `search_knowledge` | semantic search; `collection` or `collections` for several at once |
+| `search_knowledge` | semantic search; `collection` or `collections` for several at once, `min_score` for the floor |
 | `create_collection` | make a collection, or return the existing one of that name |
 | `upload_document` | put text into a collection, by content |
 | `upload_document_from_path` | the same, but the server reads the file off disk itself |
-| `remove_document` | detach a file from a collection; the file itself stays |
+| `wait_pending` | block until a collection's embedding queue drains, or one file is linked |
+| `dedupe_collection` | keep the newest file of each name, remove the rest; dry run by default |
+| `remove_document` | take a file out of a collection — which also deletes it, see below |
+
+`search_knowledge` filters hits below `min_score` (default `MIN_SCORE`, 0.76 here).
+The floor is a property of the corpus, not of the stack: conversational text
+scores systematically lower than curated prose, so pass `min_score` per call
+rather than moving the default. Below the floor the tool says
+`nothing_above_threshold` and reports `best_score_seen`, so a model can answer
+"not in the knowledge base" instead of improvising from noise.
 
 ### Writing, and what "done" means
 
@@ -134,12 +143,47 @@ document in `pending` is on its way in, and one in neither list is genuinely
 absent. `settled: false` on an upload means the same thing. It is not a failure
 and retrying on it uploads the document twice.
 
-`replace: true` is the exception that waits: the previous version is detached
-only once the new one is linked, so the collection is never left without the
-document. If the wait times out the old version stays and `replaced` is empty.
+`wait_pending` is the way to wait for it: one blocking call until the queue is
+empty, rather than a poll loop over `list_documents`. It defaults to 45 seconds
+and caps at 55 — an MCP call over a bridge is cut at about 60, and the bridge's
+own overhead takes several seconds of that, so 55 gets cut in practice. Call it
+again if it returns `settled: false`.
+
+`replace: true` cannot finish inside the call that asks for it. The previous
+version may only be removed once the new one is linked — otherwise the collection
+spends the whole embedding window with no copy of the document — and embedding a
+160 KB file on CPU runs for minutes, well past any single RPC. So the replace
+returns immediately with the old ids in `replace_pending`, and **the server
+finishes the job on its own**, up to `OPENWEBUI_REPLACE_DEADLINE_MS` (15 min).
+No second call, and no window in which both versions answer the same query. The
+task lives in memory: if the process dies first the old version simply stays
+attached, which is what used to happen every time.
+
+**`settled: true` is not the same as "clean."** A replace that failed to remove
+the old version, or never linked before its deadline, is *finished* — so it is
+gone from `replace_pending` and the queue reads as empty. `wait_pending` also
+returns `replace_done`, the last 20 finished replaces with their `linked` and
+`detach_failed`, and sets `replace_incomplete` when one of them did not do
+everything it promised. A server restart is the one case nothing can report:
+that history is in memory too, so a replace interrupted by a restart leaves two
+versions attached and no record of it. `dedupe_collection` with `dry_run: true`
+is the check that does not depend on the process having stayed up.
+
+`dedupe_collection` cleans up after exactly that: files sharing a name, newest by
+`updated_at` kept, the rest removed. It is a dry run unless you pass
+`dry_run: false`, and it skips any group whose two newest copies carry the same
+timestamp rather than guessing which one is current.
 
 Both upload tools skip work when nothing changed: they compare the file's sha256
 against what the collection already holds and return `unchanged: true` untouched.
+
+**Removal is deletion.** `POST /knowledge/{id}/file/remove` defaults
+`delete_file` to `not ENABLE_KNOWLEDGE_FILE_RETENTION`, and retention is off by
+default — so `remove_document`, a `replace`, and `dedupe_collection` all delete
+the uploaded file, not just its membership. That is what you want for a
+superseded version (the alternative fills `uploads` with orphaned blobs), but
+there is no undo. Set `ENABLE_KNOWLEDGE_FILE_RETENTION=true` if you want the
+files kept.
 
 ### Reading files off disk
 
@@ -161,11 +205,14 @@ OPENWEBUI_UPLOAD_ROOTS=/uploads
 ```
 
 **The default is empty, which refuses every path.** Roots are colon-separated
-and are read *inside the container*, so the directory has to be mounted first.
-Paths are resolved with `realpath` before they are compared, so a symlink or a
-`..` cannot climb out of a root. Refusals carry a code — `no_roots`,
-`not_found`, `not_a_file`, `outside_roots` — and an OpenWebUI failure carries its
-status instead, so the caller can tell them apart.
+and are read *inside the container*, so the directory has to be mounted first —
+and the path you pass is the container path (`/uploads/notes.md`), not the host
+path it is mounted from. Paths are resolved with `realpath` before they are
+compared, so a symlink or a `..` cannot climb out of a root. Refusals carry a
+code — `no_roots`, `not_found`, `not_a_file`, `outside_roots`, `too_large` — and
+name the readable roots, so a caller that guessed a host path can correct itself
+without reading the compose file. An OpenWebUI failure carries its status
+instead, so the caller can tell the two apart.
 
 Deciding *which* files to send stays outside the server: manifests and hash locks
 belong to whatever sync script owns the corpus.
@@ -178,8 +225,10 @@ run mcp**openwebui-knowledge**search_knowledge {
 }
 ```
 
-Results carry `distance`, `source`, `name`, `file_id` and `start_index`, so a
-retrieved chunk can always be traced back to its file.
+Results carry `distance`, `source`, `name` and `file_id`, so a retrieved chunk
+can always be traced back to its file. There is no offset: the markdown header
+splitter this stack runs leaves the chunk's `start_index` at 0 on every chunk, so
+reporting it would only look like traceability it does not have.
 
 ## Designing collections
 

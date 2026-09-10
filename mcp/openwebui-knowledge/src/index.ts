@@ -31,8 +31,21 @@ const PAGE_ITEM_COUNT = 30;
 
 // Extraction and embedding run in a background task after an upload. How long
 // the upload tools wait for that to finish before reporting settled:false.
-const UPLOAD_SETTLE_MS = Number(process.env.OPENWEBUI_UPLOAD_SETTLE_MS ?? "60000");
+const UPLOAD_SETTLE_MS = Number(process.env.OPENWEBUI_UPLOAD_SETTLE_MS ?? "45000");
 const UPLOAD_POLL_MS = 2000;
+
+/**
+ * How long a replace keeps trying to detach the old version after the caller has
+ * gone. Embedding a large file runs for minutes, far past any single RPC, so the
+ * detach outlives the call that asked for it.
+ */
+const REPLACE_DEADLINE_MS = Number(process.env.OPENWEBUI_REPLACE_DEADLINE_MS ?? "900000");
+
+// An MCP call over a bridge is cut at about 60 s, and the bridge's own overhead
+// eats 2-5 s of that, so a 55 s wait is measurably close enough to be cut. The
+// cap stays at 55 for a client without a bridge; the default is what fits.
+const WAIT_MAX_S = 55;
+const WAIT_DEFAULT_S = 45;
 
 /**
  * Directories `upload_document_from_path` may read, colon-separated. A path
@@ -55,6 +68,8 @@ if (!OPENWEBUI_API_KEY) {
 
 const LOG = (msg: string, data?: unknown) =>
     data === undefined ? console.log(`[MCP] ${msg}`) : console.log(`[MCP] ${msg}`, data);
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms).unref());
 
 /* ------------------------------------------------------------------ *
  * OpenWebUI client
@@ -207,6 +222,31 @@ async function filesNamed(collectionId: string, filename: string): Promise<FileI
     }
 }
 
+/** Every linked file in the collection, across all pages. */
+async function allFiles(collectionId: string): Promise<FileItem[]> {
+    const found: FileItem[] = [];
+    for (let page = 1; ; page++) {
+        const { items, total } = await listKnowledgeFiles(collectionId, page);
+        found.push(...items);
+        if (items.length === 0 || page * PAGE_ITEM_COUNT >= total) return found;
+    }
+}
+
+/**
+ * Takes a file out of a collection. Not an unlink: `delete_file` defaults to
+ * `not ENABLE_KNOWLEDGE_FILE_RETENTION`, which is off by default, so OpenWebUI
+ * also deletes the file record and its blob. Left to the server's own setting —
+ * retention is the operator's call, and keeping every superseded copy is what
+ * filled `uploads` with orphans last time.
+ */
+function detachFile(collectionId: string, fileId: string): Promise<unknown> {
+    return postJson(`/api/v1/knowledge/${encodeURIComponent(collectionId)}/file/remove`, { file_id: fileId });
+}
+
+// OpenWebUI stamps updated_at when embedding finishes, so it orders versions of
+// the same document better than created_at does.
+const stamp = (f: FileItem): number => f.updated_at ?? f.created_at ?? 0;
+
 export type PathRefusal = "no_roots" | "not_found" | "not_a_file" | "outside_roots" | "too_large";
 
 /** Carries a code the caller can branch on, not just prose. */
@@ -222,6 +262,14 @@ let rootsOnce: Promise<string[]> | null = null;
 function uploadRoots(): Promise<string[]> {
     rootsOnce ??= Promise.all(UPLOAD_ROOTS.map((r) => realpath(r).catch(() => r)));
     return rootsOnce;
+}
+
+/**
+ * Refusals name the roots. A caller that guessed a host path cannot otherwise
+ * tell where the server can read, and the roots are container paths, not secrets.
+ */
+function rootsHint(): string {
+    return `readable roots (paths inside the container, mounted in docker-compose.override.yaml): ${UPLOAD_ROOTS.join(", ")}`;
 }
 
 /**
@@ -241,12 +289,12 @@ export async function resolveUploadPath(input: string): Promise<string> {
     try {
         real = await realpath(input);
     } catch {
-        throw new UploadPathError("not_found", input);
+        throw new UploadPathError("not_found", `${input}; ${rootsHint()}`);
     }
 
     const roots = await uploadRoots();
     const inside = roots.some((root) => real === root || real.startsWith(root.endsWith(sep) ? root : root + sep));
-    if (!inside) throw new UploadPathError("outside_roots", real);
+    if (!inside) throw new UploadPathError("outside_roots", `${real}; ${rootsHint()}`);
 
     const info = await stat(real);
     if (!info.isFile()) throw new UploadPathError("not_a_file", real);
@@ -279,13 +327,137 @@ async function uploadIntoCollection(collectionId: string, filename: string, body
 
 /** Resolves true once the file is linked, false once the budget runs out. */
 async function waitForLink(collectionId: string, fileId: string, filename: string, budgetMs: number): Promise<boolean> {
-    const deadline = Date.now() + budgetMs;
+    const started = Date.now();
+    const deadline = started + budgetMs;
     for (;;) {
         const linked = await filesNamed(collectionId, filename).catch(() => [] as FileItem[]);
         if (linked.some((f) => f.id === fileId)) return true;
         if (Date.now() >= deadline) return false;
-        await new Promise((r) => setTimeout(r, UPLOAD_POLL_MS));
+        // Small files link in seconds; a big one takes minutes, and every poll is a
+        // listing call, so slow down once the fast case has clearly not happened.
+        await sleep(Date.now() - started < 60_000 ? UPLOAD_POLL_MS : UPLOAD_POLL_MS * 5);
     }
+}
+
+/**
+ * A replace in flight: the new file is uploaded, the old versions are still
+ * attached, and something has to take them off once the new one is linked.
+ *
+ * The map is module-level on purpose. The streamable transport builds a fresh
+ * McpServer per request and closes it with the response, so a task owned by the
+ * server instance would die with the call that started it — which is the failure
+ * this exists to fix. It is not stored state: a task holds only what its own
+ * loop needs, and a restart loses nothing a caller cannot see (the old version
+ * simply stays attached, exactly as it did before, and dedupe_collection clears it).
+ */
+type ReplaceTask = {
+    collection_id: string;
+    file_id: string;
+    filename: string;
+    pending: string[];
+    replaced: string[];
+    detach_failed: string[];
+    linked: boolean;
+    done: Promise<void>;
+};
+
+type ReplaceDone = {
+    collection_id: string;
+    file_id: string;
+    name: string;
+    linked: boolean;
+    replaced: string[];
+    detach_failed: string[];
+    finished_at: number;
+    error?: string;
+};
+
+const replaceTasks = new Map<string, ReplaceTask>();
+
+/**
+ * The last few finished replaces. A task takes itself out of the live map when it
+ * ends, so without this a detach that failed — or a replacement that never linked
+ * before the deadline — reads exactly like a clean run to whoever asks next. Only
+ * as long as the process: a restart is the one case this cannot report, which is
+ * why the upload tools name dedupe_collection as the check.
+ */
+const REPLACE_HISTORY = 20;
+const replaceHistory: ReplaceDone[] = [];
+
+function liveReplaces(collectionId: string): ReplaceTask[] {
+    return [...replaceTasks.values()].filter((t) => t.collection_id === collectionId);
+}
+
+export function recentReplaces(collectionId: string): ReplaceDone[] {
+    return replaceHistory.filter((r) => r.collection_id === collectionId);
+}
+
+/** True of a finished replace that did not do everything it promised. */
+const incomplete = (r: ReplaceDone) => !r.linked || r.detach_failed.length > 0 || r.error !== undefined;
+
+/** Detaches `oldIds` once `fileId` is linked, however long that takes. */
+function startReplace(collectionId: string, file: FileItem, filename: string, oldIds: string[]): ReplaceTask {
+    const task: ReplaceTask = {
+        collection_id: collectionId,
+        file_id: file.id,
+        filename,
+        pending: [...oldIds],
+        replaced: [],
+        detach_failed: [],
+        linked: false,
+        done: Promise.resolve(),
+    };
+    replaceTasks.set(file.id, task);
+
+    let failure: string | undefined;
+    task.done = (async () => {
+        try {
+            task.linked = await waitForLink(collectionId, file.id, filename, REPLACE_DEADLINE_MS);
+            // Detaching before the replacement is linked would leave the collection
+            // without the document for the whole embedding window.
+            if (!task.linked) {
+                LOG(`replace ${filename}: not linked within the deadline, old version left attached`);
+                return;
+            }
+            while (task.pending.length > 0) {
+                const old = task.pending[0]!;
+                const gone = await detachFile(collectionId, old).then(
+                    () => true,
+                    () => false
+                );
+                // Moved only after the call returns, so a caller reading the task
+                // mid-flight never sees an id in two lists or in none.
+                task.pending.shift();
+                (gone ? task.replaced : task.detach_failed).push(old);
+            }
+        } catch (err) {
+            failure = err instanceof Error ? err.message : String(err);
+            LOG(`replace ${filename} failed: ${failure}`);
+        } finally {
+            replaceTasks.delete(file.id);
+            replaceHistory.push({
+                collection_id: collectionId,
+                file_id: file.id,
+                name: filename,
+                linked: task.linked,
+                replaced: [...task.replaced],
+                // Whatever never came off, however it ended: an id left in `pending`
+                // means the deadline or an error stopped the loop before it got there.
+                detach_failed: [...task.detach_failed, ...task.pending],
+                finished_at: Date.now(),
+                error: failure,
+            });
+            if (replaceHistory.length > REPLACE_HISTORY) replaceHistory.shift();
+        }
+    })();
+
+    return task;
+}
+
+/** True once the task has linked its file, false when the caller's budget runs out first. */
+async function settleWithin(task: ReplaceTask, budgetMs: number): Promise<boolean> {
+    await Promise.race([task.done, sleep(budgetMs)]);
+    return task.linked;
 }
 
 type PutResult = {
@@ -293,6 +465,7 @@ type PutResult = {
     filename: string;
     bytes: number;
     replaced: string[];
+    replace_pending: string[];
     detach_failed: string[];
     settled: boolean;
     unchanged: boolean;
@@ -305,11 +478,15 @@ type PutResult = {
  * the collection and link the file itself, which avoids the race a separate
  * `file/add` loses. And OpenWebUI links only *after* embedding, so a replacement
  * can be detached only once the new file is linked — otherwise the collection
- * spends the embedding window with no copy of the document at all. A replace
- * therefore waits, and on timeout keeps the old version and reports nothing
- * replaced.
+ * spends the embedding window with no copy of the document at all.
+ *
+ * That wait is longer than the call that asks for it: embedding a 160 KB file on
+ * CPU runs for minutes against a bridge window of about a minute. So the detach
+ * belongs to a background task, and `wait` only decides how long this caller
+ * watches it. Whoever stops watching gets `replace_pending` instead of `replaced`
+ * — the old version comes off regardless, rather than being left for a human.
  */
-async function putDocument(args: {
+export async function putDocument(args: {
     collectionId: string;
     filename: string;
     body: Uint8Array;
@@ -325,30 +502,39 @@ async function putDocument(args: {
     // sha256 turns that refusal into a plain no-op the caller can read.
     const identical = existing.find((f) => f.hash === digest);
     if (identical) {
-        return { file_id: identical.id, filename, bytes, replaced: [], detach_failed: [], settled: true, unchanged: true };
+        return {
+            file_id: identical.id,
+            filename,
+            bytes,
+            replaced: [],
+            replace_pending: [],
+            detach_failed: [],
+            settled: true,
+            unchanged: true,
+        };
     }
 
     const file = await uploadIntoCollection(collectionId, filename, body);
+    const task = replace && existing.length > 0 ? startReplace(collectionId, file, filename, existing.map((f) => f.id)) : null;
 
-    // A replace has to wait, so callers pass a positive budget for it; see the tools.
-    const settled = waitMs > 0 ? await waitForLink(collectionId, file.id, filename, waitMs) : false;
+    const settled = waitMs <= 0
+        ? false
+        : task
+          ? await settleWithin(task, waitMs)
+          : await waitForLink(collectionId, file.id, filename, waitMs);
 
-    const replaced: string[] = [];
-    const detach_failed: string[] = [];
-    if (replace && settled) {
-        for (const old of existing) {
-            // Record only what actually came off. Reporting a failed detach as done
-            // tells the caller the old copy is gone while it is still being searched.
-            const gone = await postJson(`/api/v1/knowledge/${encodeURIComponent(collectionId)}/file/remove`, {
-                file_id: old.id,
-            })
-                .then(() => true)
-                .catch(() => false);
-            (gone ? replaced : detach_failed).push(old.id);
-        }
-    }
-
-    return { file_id: file.id, filename, bytes, replaced, detach_failed, settled, unchanged: false };
+    // A snapshot of the task as it stands now: whatever is still in `pending` will
+    // come off after this call returns.
+    return {
+        file_id: file.id,
+        filename,
+        bytes,
+        replaced: task ? [...task.replaced] : [],
+        replace_pending: task ? [...task.pending] : [],
+        detach_failed: task ? [...task.detach_failed] : [],
+        settled,
+        unchanged: false,
+    };
 }
 
 /**
@@ -389,7 +575,11 @@ function toChunks(raw: RetrievalResponse): Chunk[] {
                 source: typeof meta.source === "string" ? meta.source : undefined,
                 name: typeof meta.name === "string" ? meta.name : undefined,
                 file_id: typeof meta.file_id === "string" ? meta.file_id : undefined,
-                start_index: typeof meta.start_index === "number" ? meta.start_index : undefined,
+                // Only when it means something. The markdown header splitter this stack
+                // runs leaves it at 0 on every chunk, which reads like a real offset and
+                // is not one; a splitter that does fill it still comes through.
+                start_index:
+                    typeof meta.start_index === "number" && meta.start_index > 0 ? meta.start_index : undefined,
                 text: (text ?? "").trim(),
             };
         })
@@ -456,7 +646,7 @@ function paging(page: number, total: number) {
 }
 
 function createMcpServer(): McpServer {
-    const mcp = new McpServer({ name: "openwebui-knowledge", version: "1.1.0" });
+    const mcp = new McpServer({ name: "openwebui-knowledge", version: "1.2.0" });
 
     mcp.registerTool(
         "ping_openwebui",
@@ -512,7 +702,8 @@ function createMcpServer(): McpServer {
                 "List files inside a knowledge collection. `collection` accepts an id or a name; " +
                 "defaults to OPENWEBUI_DEFAULT_COLLECTION. Optional `query` filters by filename. " +
                 "`pending` lists files still being embedded: they are not in `files` yet and are not " +
-                "searchable, but they are not lost either.",
+                "searchable, but they are not lost either. Timestamps are unix seconds; `updated_at` " +
+                "is set when embedding finishes, so it tells two same-named files apart.",
             inputSchema: {
                 collection: z.string().optional(),
                 query: z.string().optional(),
@@ -535,6 +726,8 @@ function createMcpServer(): McpServer {
                     file_id: f.id,
                     name: fileName(f),
                     size: f.meta?.size,
+                    created_at: f.created_at,
+                    updated_at: f.updated_at,
                 })),
                 // OpenWebUI links a file only after its embedding finishes, so `files`
                 // is accurate but not yet complete. These are on the way in; a document
@@ -741,7 +934,11 @@ function createMcpServer(): McpServer {
                 "Set `replace` to drop any file already in the collection with the same filename, which is what " +
                 "you want when re-syncing a document that changed. Returns as soon as the upload is accepted; " +
                 "`settled: false` means embedding is still running in the background, not that it failed. " +
-                "Set `wait` to block until it finishes. Prefer upload_document_from_path when the file is on disk.",
+                "Old versions listed in `replace_pending` are removed by the server once the new one is " +
+                "linked, with no further call needed — unless the server restarts first, in which case " +
+                "the old version stays and dedupe_collection dry_run: true is the check. Set `wait` to " +
+                "block until it finishes, or call wait_pending. Prefer upload_document_from_path when the " +
+                "file is on disk.",
             inputSchema: {
                 filename: z.string().min(1),
                 content: z.string().min(1),
@@ -770,9 +967,7 @@ function createMcpServer(): McpServer {
                     filename,
                     body: new TextEncoder().encode(content),
                     replace: replace ?? false,
-                    // A replace waits whether or not `wait` was asked for: the old version
-                    // is detached only once the new one is linked.
-                    waitMs: wait || replace ? UPLOAD_SETTLE_MS : 0,
+                    waitMs: wait ? UPLOAD_SETTLE_MS : 0,
                 });
 
                 return ok({
@@ -784,6 +979,8 @@ function createMcpServer(): McpServer {
                     // below the stored size. list_documents reports the real byte count.
                     chars: content.length,
                     replaced: result.replaced,
+                    replace_pending: result.replace_pending,
+                    detach_failed: result.detach_failed,
                     settled: result.settled,
                 });
             }
@@ -800,17 +997,21 @@ function createMcpServer(): McpServer {
                 "basename; `collection` takes an id or a name. Returns `unchanged: true` and touches nothing " +
                 "when the collection already holds a byte-identical file of that name. Returns without waiting " +
                 "for embedding unless `wait` is set — `settled: false` is a queue, not a failure, and retrying " +
-                "on it duplicates the document. `replace` waits regardless, because the previous version is " +
-                "detached only once the new one is linked; on timeout the old version stays and `replaced` is " +
-                "empty; anything that did not come off is listed in `detach_failed`. Path refusals carry a code: " +
-                "no_roots, not_found, not_a_file, outside_roots, too_large.",
+                "on it duplicates the document. `replace` no longer waits: the previous version is detached by " +
+                "the server once the new one is linked, however long embedding takes, and until then it is " +
+                "listed in `replace_pending`; anything that did not come off is in `detach_failed`. " +
+                "That task lives in the server process: if it restarts mid-replace the old version stays " +
+                "attached and nothing reports it, so check with dedupe_collection dry_run: true. " +
+                "`timeout_s` only sets how long `wait` blocks, and caps at 55 because an MCP call over a " +
+                "bridge is cut at about 60 s — use wait_pending for a long embedding. Path refusals carry a " +
+                "code: no_roots, not_found, not_a_file, outside_roots, too_large, and name the readable roots.",
             inputSchema: {
                 path: z.string().min(1),
                 collection: z.string().optional(),
                 filename: z.string().optional(),
                 replace: z.boolean().optional(),
                 wait: z.boolean().optional(),
-                timeout_s: z.number().int().min(1).max(900).optional(),
+                timeout_s: z.number().int().min(1).max(WAIT_MAX_S).optional(),
             },
         },
         guard(
@@ -832,14 +1033,13 @@ function createMcpServer(): McpServer {
                 const real = await resolveUploadPath(path);
                 const collectionId = await resolveCollection(collection);
                 const body = await readFile(real);
-                const budgetMs = (timeout_s ?? UPLOAD_SETTLE_MS / 1000) * 1000;
 
                 const result = await putDocument({
                     collectionId,
                     filename: filename ?? basename(real),
                     body,
                     replace: replace ?? false,
-                    waitMs: wait || replace ? budgetMs : 0,
+                    waitMs: wait ? (timeout_s ?? UPLOAD_SETTLE_MS / 1000) * 1000 : 0,
                 });
 
                 return ok({ ok: true, collection: collectionId, path: real, ...result });
@@ -848,10 +1048,155 @@ function createMcpServer(): McpServer {
     );
 
     mcp.registerTool(
+        "wait_pending",
+        {
+            description:
+                "Block until a collection's embedding queue is empty, or until one `file_id` is linked. " +
+                "Use it instead of polling list_documents after an upload: one call, not five. Returns " +
+                "`settled: false` if the timeout came first — call again, nothing is lost. `settled: true` " +
+                "for a whole collection also means no replace is still waiting to remove an old version. " +
+                "Check `replace_done` with it: a replace that failed to remove the old version, or never " +
+                "linked before its deadline, is finished and therefore absent from `replace_pending` — " +
+                "`settled: true` alone does not mean the collection is clean. Defaults to 45 s: the cap " +
+                "is 55 but an MCP call over a bridge is cut at about 60 and the bridge's own overhead " +
+                "takes several seconds of that.",
+            inputSchema: {
+                collection: z.string().optional(),
+                file_id: z.string().optional(),
+                timeout_s: z.number().int().min(1).max(WAIT_MAX_S).optional(),
+            },
+        },
+        guard(async ({ collection, file_id, timeout_s }: { collection?: string; file_id?: string; timeout_s?: number }) => {
+            const id = await resolveCollection(collection);
+            const started = Date.now();
+            const deadline = started + (timeout_s ?? WAIT_DEFAULT_S) * 1000;
+
+            // Membership is by name, so waiting on one file costs one lookup up front.
+            const wanted = file_id ? fileName(await getFile(file_id)) : undefined;
+            if (file_id && !wanted) throw new Error(`File ${file_id} has no filename to match on.`);
+
+            let pending: FileItem[] = [];
+            let settled = false;
+            for (;;) {
+                pending = await pendingFiles(id).catch(() => [] as FileItem[]);
+                settled = wanted
+                    ? (await filesNamed(id, wanted)).some((f) => f.id === file_id)
+                    : pending.length === 0 && liveReplaces(id).length === 0;
+                if (settled || Date.now() >= deadline) break;
+                await sleep(UPLOAD_POLL_MS);
+            }
+
+            const done = recentReplaces(id);
+            return ok({
+                ok: true,
+                collection: id,
+                settled,
+                waited_ms: Date.now() - started,
+                pending: pending.map((f) => ({ file_id: f.id, name: fileName(f) })),
+                replace_pending: liveReplaces(id).map((t) => ({
+                    file_id: t.file_id,
+                    name: t.filename,
+                    removing: t.pending,
+                })),
+                // Finished replaces, this process only. The ones that did not finish
+                // cleanly are the point: nothing else reports them.
+                replace_done: done,
+                ...(done.some(incomplete)
+                    ? {
+                          replace_incomplete: true,
+                          hint: "A replace did not finish cleanly. Run dedupe_collection with "
+                              + "dry_run: true to see what is still attached.",
+                      }
+                    : {}),
+            });
+        })
+    );
+
+    mcp.registerTool(
+        "dedupe_collection",
+        {
+            description:
+                "Find files sharing a filename in a collection and detach all but the newest by " +
+                "`updated_at`, which is when embedding finished. Duplicates accumulate silently when a " +
+                "replace never completed — including one lost to a server restart. `dry_run` defaults to " +
+                "true: it reports what it would do and changes nothing. **While " +
+                "ENABLE_KNOWLEDGE_FILE_RETENTION is off, which is the default, detach means delete**: " +
+                "`dry_run: false` destroys the file and its blob, not just its membership, and there is " +
+                "no undo. Read the dry run first. A group whose two newest copies carry the same " +
+                "timestamp is reported under `skipped` and left alone rather than guessed at.",
+            inputSchema: {
+                collection: z.string().optional(),
+                dry_run: z.boolean().optional(),
+            },
+        },
+        guard(async ({ collection, dry_run }: { collection?: string; dry_run?: boolean }) => {
+            const id = await resolveCollection(collection);
+            const dry = dry_run ?? true;
+
+            const groups = new Map<string, FileItem[]>();
+            for (const f of await allFiles(id)) {
+                const name = fileName(f) ?? f.id;
+                const seen = groups.get(name);
+                if (seen) seen.push(f);
+                else groups.set(name, [f]);
+            }
+
+            const describe = (name: string, f: FileItem) => ({ name, file_id: f.id, updated_at: stamp(f) });
+            const kept: ReturnType<typeof describe>[] = [];
+            const detached: ReturnType<typeof describe>[] = [];
+            const detach_failed: ReturnType<typeof describe>[] = [];
+            const skipped: Array<{ name: string; reason: string; file_ids: string[] }> = [];
+
+            for (const [name, group] of groups) {
+                if (group.length < 2) continue;
+                const [newest, runnerUp, ...rest] = [...group].sort((a, b) => stamp(b) - stamp(a));
+
+                // Detaching the wrong copy loses the newer version and looks like a
+                // successful cleanup, so a tie is left for a human to resolve.
+                if (stamp(newest!) === 0 || stamp(newest!) === stamp(runnerUp!)) {
+                    skipped.push({
+                        name,
+                        reason: "timestamps do not separate the newest copy",
+                        file_ids: group.map((f) => f.id),
+                    });
+                    continue;
+                }
+
+                kept.push(describe(name, newest!));
+                for (const old of [runnerUp!, ...rest]) {
+                    if (dry) {
+                        detached.push(describe(name, old));
+                        continue;
+                    }
+                    const gone = await detachFile(id, old.id).then(
+                        () => true,
+                        () => false
+                    );
+                    (gone ? detached : detach_failed).push(describe(name, old));
+                }
+            }
+
+            return ok({
+                ok: true,
+                collection: id,
+                dry_run: dry,
+                names: groups.size,
+                // In a dry run these are what *would* come off; nothing was touched.
+                kept,
+                detached,
+                detach_failed,
+                skipped,
+            });
+        })
+    );
+
+    mcp.registerTool(
         "remove_document",
         {
             description:
-                "Detach a file from a knowledge collection by file_id. The file itself stays in OpenWebUI.",
+                "Take a file out of a knowledge collection by file_id. Unless OpenWebUI is set to retain " +
+                "knowledge files (it is not by default), this also deletes the file itself — it is not an " +
+                "unlink, and there is no undo.",
             inputSchema: {
                 file_id: z.string().min(1),
                 collection: z.string().optional(),

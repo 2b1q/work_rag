@@ -67,6 +67,17 @@ describe("resolveUploadPath", () => {
         await refusal(root, "not_a_file");
     });
 
+    // A caller that guessed a host path can only fix it if the refusal says where
+    // the server can actually read.
+    it("names the readable roots when it refuses a path", async () => {
+        for (const bad of [join(root, "missing.md"), join(outside, "secret.md")]) {
+            await assert.rejects(
+                () => mod.resolveUploadPath(bad),
+                (err: unknown) => err instanceof Error && err.message.includes(root)
+            );
+        }
+    });
+
     it("refuses a file over the size cap", async () => {
         const big = join(root, "big.md");
         await writeFile(big, "x".repeat(64));
