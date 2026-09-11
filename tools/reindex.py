@@ -35,6 +35,10 @@ PAGE_ITEM_COUNT = 30
 # can take a minute; the ceiling is here only so a wedged call cannot hang a run.
 REQUEST_TIMEOUT_S = 900
 
+# Files to finish before the estimate switches from "time per file" to measured
+# throughput. Cost tracks size, so a run of small files predicts a large one badly.
+WARMUP_FILES = 10
+
 
 class Api:
     def __init__(self, base: str, key: str) -> None:
@@ -97,6 +101,10 @@ def reembed(api: Api, file_id: str) -> tuple[bool, str | None]:
     return False, f"status={data.get('status')} {data.get('error')}"
 
 
+def size_of(item: dict) -> int:
+    return ((item.get("meta") or {}).get("size")) or 0
+
+
 def run(api: Api, ref: str, state_dir: str, limit: int | None) -> int:
     collection_id = resolve(api, ref)
     state_path = os.path.join(state_dir, f"reindex-{ref}.jsonl")
@@ -117,10 +125,17 @@ def run(api: Api, ref: str, state_dir: str, limit: int | None) -> int:
     print(f"{ref} ({collection_id}): {len(files)} linked, {len(done)} already done, {len(todo)} to go", flush=True)
 
     started, failures, timings = time.time(), 0, []
+    # Throughput is measured here, never carried in: the rate depends on the
+    # machine and on how the corpus chunks, and it moved several-fold between
+    # collections on the same host.
+    left = sum(size_of(f) for f in todo)
+    done_bytes = done_secs = 0.0
+
     with open(state_path, "a") as state:
         for index, item in enumerate(todo, start=1):
             file_id = item["id"]
             name = (item.get("meta") or {}).get("name") or item.get("filename")
+            size = size_of(item)
             began = time.time()
             try:
                 ok, error = reembed(api, file_id)
@@ -132,15 +147,29 @@ def run(api: Api, ref: str, state_dir: str, limit: int | None) -> int:
             took = round(time.time() - began, 1)
             timings.append(took)
             failures += 0 if ok else 1
+            done_bytes += size
+            done_secs += took
+            left -= size
             state.write(
                 json.dumps(
-                    {"file_id": file_id, "name": name, "ok": ok, "error": error, "secs": took, "at": int(time.time())}
+                    {
+                        "file_id": file_id,
+                        "name": name,
+                        "ok": ok,
+                        "error": error,
+                        "secs": took,
+                        "bytes": size,
+                        "at": int(time.time()),
+                    }
                 )
                 + "\n"
             )
             state.flush()
 
-            remaining = (time.time() - started) / index * (len(todo) - index)
+            if index >= WARMUP_FILES and done_bytes and left:
+                remaining = left / (done_bytes / done_secs)
+            else:
+                remaining = (time.time() - started) / index * (len(todo) - index)
             print(
                 f"  [{index}/{len(todo)}] {'ok  ' if ok else 'FAIL'} {took:>6}s  eta {round(remaining / 60)}m  {name}"
                 + (f"  -- {error}" if error else ""),
@@ -149,7 +178,11 @@ def run(api: Api, ref: str, state_dir: str, limit: int | None) -> int:
 
     elapsed = round((time.time() - started) / 60, 1)
     median = statistics.median(timings) if timings else 0
-    print(f"{ref}: {len(todo) - failures} ok, {failures} failed, {elapsed}m (median {median}s/file)", flush=True)
+    rate = f", {round(done_bytes / done_secs / 1024, 1)} KB/s" if done_secs and done_bytes else ""
+    print(
+        f"{ref}: {len(todo) - failures} ok, {failures} failed, {elapsed}m (median {median}s/file{rate})",
+        flush=True,
+    )
     return failures
 
 

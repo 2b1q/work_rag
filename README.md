@@ -358,9 +358,40 @@ that is still empty.
 
 Progress goes to `reindex-<collection>.jsonl` next to where you run it
 (gitignored): a file recorded `ok` is skipped, so an interrupted pass resumes.
-Re-embedding is CPU-bound and local — cost is heat and time, not tokens. Check
-the result by measurement, not by the log: a few probe queries at your calibrated
-`min_score`, and unrelated ones that should fall below it.
+Re-embedding is CPU-bound and local — cost is heat and time, not tokens.
+
+**The estimate is measured, not assumed.** Cost tracks file size, not file count,
+and the rate per kilobyte moves several-fold between collections on one host, so
+no constant survives the trip from one corpus to another. The script records each
+file's size beside its time and switches to measured throughput once it has a
+warmup behind it; the same numbers are what a later "why was this slow" starts
+from.
+
+**Watching a run you have no log for.** `updated_at` is stamped when a file
+finishes embedding, so `list_documents` sorted by it — `order_by: updated_at`,
+`direction: desc` — shows the top record moving while a reindex is working and
+standing still once it is done. That is an external progress signal: it needs no
+access to the script, and it measures the server rather than the runner.
+
+### Is a collection intact?
+
+Three checks, cheapest first. The first two cost one call each and catch the
+failure that looks like nothing at all — every document listed, `failed` empty,
+and no search result.
+
+1. **Count the vector stores against the files.** OpenWebUI writes a `file-{id}`
+   store per document, so the number of `file-*` collections in the vector
+   database should match the collection's file count. A shortfall names how many
+   documents are lost, not merely that something is.
+2. **Ask whether the collection exists in the vector database at all**, under its
+   own id. A knowledge collection with no store behind it is intact in Postgres
+   and empty to every query.
+3. **Run a probe query.** This is the one that catches a store that exists and is
+   empty, and it is the only check that exercises the retrieval path end to end.
+
+The embedding date is the fastest smell of the three: a collection whose newest
+`updated_at` predates its newest content has not been embedded since that content
+arrived.
 
 ## Designing collections
 
