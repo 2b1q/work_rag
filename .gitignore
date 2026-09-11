@@ -10,3 +10,6 @@ HANDOFF.md
 .sanitize-deny
 docker-compose.override.yaml
 dumps/
+
+# Resume log for tools/reindex.py — scratch, not a record.
+reindex-*.jsonl

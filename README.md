@@ -114,9 +114,9 @@ guess a uuid.
 | Tool | Does |
 | --- | --- |
 | `ping_openwebui` | check the API is reachable and the key is valid |
-| `list_collections` | collections, paged, `query` filters by name server-side |
-| `list_documents` | files in a collection, with `total` and `has_more` |
-| `get_document` | one file's text by `file_id`, clipped to `max_chars` |
+| `list_collections` | collections, paged; `query` searches name, description and owner server-side |
+| `list_documents` | files in a collection, plus what is still embedding and what failed |
+| `get_document` | one file's text by `file_id`, a window at a time (`offset`, `next_offset`) |
 | `select_context_files` | several files concatenated into one context block |
 | `search_knowledge` | semantic search; `collection` or `collections` for several at once, `min_score` for the floor |
 | `create_collection` | make a collection, or return the existing one of that name |
@@ -126,7 +126,17 @@ guess a uuid.
 | `dedupe_collection` | keep the newest file of each name, remove the rest; dry run by default |
 | `remove_document` | take a file out of a collection — which also deletes it, see below |
 
-`search_knowledge` filters hits below `min_score` (default `MIN_SCORE`, 0.76 here).
+Every tool is annotated (`readOnlyHint`, `destructiveHint`, `idempotentHint`), so
+a client can tell the six read tools from the three that delete. Failures come
+back as JSON with a `code` — `collection_not_found`, `collection_ambiguous`,
+`processing_failed`, `openwebui_unreachable`, `openwebui_timeout`,
+`openwebui_http`, `file_not_found`, `path_refused`, `invalid_argument` — so a
+caller can branch on the failure instead of reading prose.
+
+`search_knowledge` filters hits below `min_score` (default `OPENWEBUI_MIN_SCORE`,
+0.76 unless set in `.env`). Each hit carries `score`, a similarity in [0,1] where
+higher is better — the same number OpenWebUI confusingly returns as `distance`,
+which is still emitted under that name for one release.
 The floor is a property of the corpus, not of the stack: conversational text
 scores systematically lower than curated prose, so pass `min_score` per call
 rather than moving the default. Below the floor the tool says
@@ -138,10 +148,20 @@ rather than moving the default. Below the floor the tool says
 Uploads return as soon as OpenWebUI accepts them. Embedding continues in the
 background, and **a file is linked to its collection only after it finishes** —
 so a freshly uploaded document is briefly in neither `list_documents`' `files`
-nor the search index. That is why `list_documents` also returns `pending`: a
-document in `pending` is on its way in, and one in neither list is genuinely
-absent. `settled: false` on an upload means the same thing. It is not a failure
-and retrying on it uploads the document twice.
+nor the search index. A document is therefore in exactly one of three states, and
+`list_documents` reports all three:
+
+- **`files`** — linked and searchable.
+- **`pending`** — still embedding. Not a failure; retrying on it uploads the
+  document twice.
+- **`failed`** — extraction or embedding died. The file is in no other listing,
+  `files/pending` excludes it by design, and uploading the same bytes again fails
+  the same way. Read `error` for the reason.
+
+That last one is why "absent from both other lists" cannot be read as "never
+uploaded". `failed` is a bounded scan of the newest uploads, so it reports recent
+failures rather than every historical one. `settled: false` on an upload means
+"still embedding"; `failed: true` means the upload is over and it lost.
 
 `wait_pending` is the way to wait for it: one blocking call until the queue is
 empty, rather than a poll loop over `list_documents`. It defaults to 45 seconds
@@ -174,16 +194,27 @@ is the check that does not depend on the process having stayed up.
 `dry_run: false`, and it skips any group whose two newest copies carry the same
 timestamp rather than guessing which one is current.
 
-Both upload tools skip work when nothing changed: they compare the file's sha256
-against what the collection already holds and return `unchanged: true` untouched.
+Both upload tools skip work when nothing changed: they compare the sha256 of the
+bytes being uploaded against `meta.file_hash` on what the collection already
+holds, and return `unchanged: true` untouched. Note *which* digest: OpenWebUI's
+`hash` column is the sha256 of the **extracted text**, not of the file, and it is
+cleared to null when processing fails — comparing against it matches only where
+extraction happens to be the identity.
 
-**Removal is deletion.** `POST /knowledge/{id}/file/remove` defaults
-`delete_file` to `not ENABLE_KNOWLEDGE_FILE_RETENTION`, and retention is off by
-default — so `remove_document`, a `replace`, and `dedupe_collection` all delete
-the uploaded file, not just its membership. That is what you want for a
-superseded version (the alternative fills `uploads` with orphaned blobs), but
-there is no undo. Set `ENABLE_KNOWLEDGE_FILE_RETENTION=true` if you want the
-files kept.
+**Removal is deletion.** `POST /knowledge/{id}/file/remove` takes `delete_file`
+as a query parameter defaulting to `not ENABLE_KNOWLEDGE_FILE_RETENTION`, and
+retention is off by default — so the call that reads as "detach" deletes the file
+record and its blob. `remove_document` states the outcome rather than inheriting
+it: it passes the flag explicitly and answers with `deleted_file`, and
+`keep_file: true` unlinks without deleting. A file belonging to several
+collections is deleted out of all of them.
+
+The superseding paths — a `replace`, and `dedupe_collection` — leave the flag
+unset and so follow the server's retention setting, which is what an operator who
+turned retention on has asked for. With it off (the default) they delete, which is
+what you want for a superseded version: the alternative fills `uploads` with
+orphaned blobs. There is no undo either way, which is why `dedupe_collection` is
+a dry run unless told otherwise and stops at `max_deletions` (20 by default).
 
 ### Reading files off disk
 
@@ -225,10 +256,111 @@ run mcp**openwebui-knowledge**search_knowledge {
 }
 ```
 
-Results carry `distance`, `source`, `name` and `file_id`, so a retrieved chunk
-can always be traced back to its file. There is no offset: the markdown header
-splitter this stack runs leaves the chunk's `start_index` at 0 on every chunk, so
-reporting it would only look like traceability it does not have.
+Results carry `score`, `name` and `file_id`, so a retrieved chunk can always be
+traced back to its file. There is no offset: the markdown header splitter this
+stack runs leaves the chunk's `start_index` at 0 on every chunk, so reporting it
+would only look like traceability it does not have.
+
+## Exposure
+
+Everything here is meant to run on one machine. Three things decide how much of
+it a second machine — or a second process — can reach.
+
+**Ports.** OpenWebUI is the only service worth publishing, and then only behind a
+reverse proxy. ChromaDB has no authentication of its own and is bound to
+`127.0.0.1` in `docker-compose.yaml` for that reason: OpenWebUI reaches it over
+the compose network as `vector-db`, and published on every interface it is an open
+vector store on the LAN. The MCP bridge is on `127.0.0.1:8787`.
+
+**Origin.** `/mcp` refuses any request that carries an `Origin` header not listed
+in `MCP_ALLOWED_ORIGINS` (empty by default). An MCP client sends no Origin at
+all; a browser always does. That is what stops a page the user has open from
+resolving its own hostname to `127.0.0.1` and talking to the bridge on their
+behalf — the one attack a loopback bind does not prevent.
+
+**Key scope.** An OpenWebUI `sk-...` key is the whole user, not a scope. On a
+single-user stack, `ENABLE_API_KEY_ENDPOINT_RESTRICTIONS=true` plus
+`API_KEYS_ALLOWED_ENDPOINTS` narrows every key on the instance to what this
+server actually calls:
+
+```sh
+API_KEYS_ALLOWED_ENDPOINTS=/api/models,/api/v1/knowledge,/api/v1/files,/api/v1/retrieval/query
+```
+
+## Backup and restore
+
+Two of these hold state you cannot regenerate, and one you can.
+
+- **PostgreSQL** — metadata, collection membership, and the extracted text of every
+  document (`file.data.content`). This is the source of truth.
+- **`open_webui_data`** — the uploaded blobs, plus OpenWebUI's own files.
+- **`chroma_data`** — vectors. Derived: they can be rebuilt from the text in
+  Postgres, at the cost of a full re-embed.
+
+```sh
+# Back up. dumps/ is gitignored and the pre-commit hook refuses it by name.
+mkdir -p dumps
+docker compose exec -T postgres pg_dump -Fc -U "$POSTGRES_USER" "$POSTGRES_DB" > dumps/pg.dump
+docker run --rm -v "${COMPOSE_PROJECT_NAME:-work-rag}_open_webui_data":/v -v "$PWD/dumps":/out \
+    alpine tar czf /out/open_webui_data.tgz -C /v .
+docker run --rm -v "${COMPOSE_PROJECT_NAME:-work-rag}_chroma_data":/v -v "$PWD/dumps":/out \
+    alpine tar czf /out/chroma_data.tgz -C /v .
+```
+
+```sh
+# Restore a volume. Stop the service first: untarring over a live SQLite file is
+# how you turn one lost store into two.
+docker compose stop vector-db
+docker run --rm -v "${COMPOSE_PROJECT_NAME:-work-rag}_chroma_data":/v -v "$PWD/dumps":/in \
+    alpine sh -c 'rm -rf /v/* /v/..?* 2>/dev/null; tar xzf /in/chroma_data.tgz -C /v'
+docker compose up -d vector-db
+
+# Restore Postgres into an empty database, then rebuild the vectors from it.
+docker compose exec -T postgres pg_restore -c -U "$POSTGRES_USER" -d "$POSTGRES_DB" < dumps/pg.dump
+```
+
+**A volume only protects what the image actually writes into it.** Check the
+mount against the image's own configuration after every tag bump — see the note
+on `chroma_data` in `docker-compose.yaml`. A volume mounted on a path the process
+ignores is invisible: the data lands in the container's writable layer, every
+backup of the volume is empty, and the first `docker compose up` that recreates
+the service deletes the store. The check is a measurement, not a reading: write
+one document, `docker compose up -d --force-recreate <service>`, search for it
+again.
+
+### Rebuilding the vectors
+
+The vectors are the one derived layer, so losing them is recoverable: the
+extracted text of every document lives in Postgres. `tools/reindex.py` walks one
+collection and re-embeds it a file at a time.
+
+```sh
+export OPENWEBUI_URL=http://127.0.0.1:3000
+export OPENWEBUI_API_KEY=      # the sk-... key, same one the MCP server uses
+
+python3 tools/reindex.py my-docs --limit 2     # try two files first
+python3 tools/reindex.py my-docs
+```
+
+Use it rather than `POST /api/v1/knowledge/reindex`, which walks every collection
+in a single synchronous request and **drops each collection's vectors before
+refilling it** — so a run cut off by a client timeout leaves collections empty.
+The per-file route (`POST /api/v1/files/{id}/data/content/update`) adds the new
+vectors before removing the old ones and touches one collection at a time.
+
+**A 200 from that route does not mean the file was embedded.** The handler
+catches a processing exception, logs it, and answers successfully anyway; the
+per-collection step below it only warns. Success has to be read back from the
+file record's `data.status == "completed"`, which is what the script does and
+what the `failed` list in `list_documents` surfaces afterwards. Treating the
+status code as the answer is how a reindex reports a clean run over a collection
+that is still empty.
+
+Progress goes to `reindex-<collection>.jsonl` next to where you run it
+(gitignored): a file recorded `ok` is skipped, so an interrupted pass resumes.
+Re-embedding is CPU-bound and local — cost is heat and time, not tokens. Check
+the result by measurement, not by the log: a few probe queries at your calibrated
+`min_score`, and unrelated ones that should fall below it.
 
 ## Designing collections
 
@@ -263,6 +395,11 @@ Found by measurement on this stack; the defaults are not good for every corpus.
 - **`ENABLE_RAG_HYBRID_SEARCH`** defaults to off, and while it is off the API
   ignores `hybrid: true` without an error. On, BM25 recovers exact terms
   (identifiers, parameter names, issue numbers) that pure vector search misses.
+  There is no per-query switch either way: with the flag on, the branch that
+  handles `hybrid: false` re-checks the same flag and runs hybrid search anyway,
+  just with the global parameters instead of the call's. So `search_knowledge`
+  exposes the knobs (`rerank.k_reranker`, `rerank.r`, `rerank.bm25_weight`) and
+  leaves the switch where it actually lives, with the operator.
 - **A vector store is pinned to its model's dimension.** Changing the embedding
   model makes every later write fail with `expecting embedding with dimension of
   384, got 1024`. The collection has to be dropped and refilled.

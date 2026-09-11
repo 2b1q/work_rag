@@ -29,6 +29,7 @@ belong to OpenWebUI; going around it would fork the ranking behaviour.
 | [prompts/](prompts/) | system prompt used in the OpenWebUI chat UI |
 | `.env` | credentials and per-deployment settings — gitignored, see `.env.example` |
 | [tools/githooks/pre-commit](tools/githooks/pre-commit) | sanitization gate; private terms go in gitignored `.sanitize-deny` |
+| [tools/reindex.py](tools/reindex.py) | re-embed one collection file by file, resumably, when the vector store is lost |
 
 ## MCP tools
 
@@ -47,8 +48,10 @@ Blocking tools default to 45 s and cap at 55: an MCP call over a bridge is cut a
 about 60 and the bridge's own overhead takes several seconds of that.
 
 `collection` accepts an id **or a name** — a model can produce a name and cannot
-guess a uuid. `search_knowledge` filters by `min_score` (see below) and takes
-`collections` for a multi-collection query.
+guess a uuid; an ambiguous name is refused with the candidates rather than
+resolved to whichever matched first. `search_knowledge` filters by `min_score`
+(see below) and takes `collections` for a multi-collection query. Every tool
+carries MCP annotations, and every failure is JSON with a `code`.
 
 Transport: Streamable HTTP on `/mcp`, deprecated HTTP+SSE on `/sse` for older
 clients. Register with:
@@ -127,9 +130,24 @@ command.upgrade(cfg, "head")'
 
 **A vector store is pinned to its embedding model's dimension.** Change the model
 and every write fails with `expecting embedding with dimension of N, got M`. The
-collection has to be dropped and refilled. A Chroma major upgrade can likewise
-leave the old data unreadable — the documents survive in Postgres, so
-`POST /api/v1/knowledge/reindex` rebuilds the vectors.
+collection has to be dropped and refilled. The documents survive in Postgres, so
+`POST /api/v1/knowledge/reindex` rebuilds the vectors — it walks the
+`knowledge_file` join, so orphaned file records cost nothing, but it is one
+synchronous request over every linked file and it drops each collection *before*
+refilling it, so an interrupted run leaves collections empty.
+
+**Check a volume against the path the image actually writes to.** `chromadb/chroma`
+carries `persist_path: "/data"` in its `/config.yaml`; a volume mounted on the
+older `/chroma/chroma` is accepted, stays empty, and never receives a byte. The
+vectors then live in the container's writable layer, so every backup of the volume
+is empty and the next `docker compose up` that *recreates* the service — a changed
+`ports` line or an image bump is enough, and compose recreates dependencies too —
+deletes the entire store while the volume still looks healthy. Nothing errors:
+`list_documents` keeps reporting every file, `failed` stays empty, and search
+simply returns nothing. What distinguishes it fastest is the embedding date
+against the file date, and asking Chroma directly whether a collection with that
+id exists at all. Verify by measurement after any change: write one document,
+`docker compose up -d --force-recreate vector-db`, search for it again.
 
 **Attach on upload, never in a second call.** `POST /api/v1/files/` followed by
 `knowledge/{id}/file/add` loses a race it gives no hint of: extraction runs in a
@@ -158,16 +176,38 @@ already-detached file came back 404.
 extraction and embedding first and calls `add_file_to_knowledge_by_id` last, so
 between the upload and the end of the queue the document is in no listing and in
 no search result. Nothing is stale and nothing is lost — the file simply is not a
-member yet. Read `knowledge/{id}/files/pending` to see it, and treat "absent from
-both" as the only real absence. The trap is that a listing taken in that window
-looks authoritative and is merely early; a caller that retries on it uploads the
-document a second time. It also means a replacement cannot be detached until its
-successor is linked, or the collection spends the whole embedding window empty.
+member yet. Read `knowledge/{id}/files/pending` to see it. The trap is that a
+listing taken in that window looks authoritative and is merely early; a caller
+that retries on it uploads the document a second time. It also means a
+replacement cannot be detached until its successor is linked, or the collection
+spends the whole embedding window empty.
+
+**"Absent from both lists" is not absence.** `files/pending` selects
+`data.status in ('pending','processing')` only, so a file whose processing
+*failed* — a rejected extension, an unreadable document, duplicate content, a
+dimension mismatch — is in neither the collection listing nor the pending one,
+and its orphaned `file` row with `meta.data.knowledge_id` is what is left. There
+is no server-side filter for it: the tools scan the newest pages of
+`GET /api/v1/files/?content=false` for `data.status == 'failed'` and surface it as
+`failed` / `failed_recent`. Read `data.error` for the reason, and do not re-upload
+the same bytes — they fail the same way.
+
+**Two hashes, and the obvious one is the wrong one.** `file.hash` is the sha256
+of the *extracted text* (`calculate_sha256_string(text_content)`), written when
+processing succeeds and set back to null when it fails. The digest of the
+uploaded bytes — the one a caller can compute before uploading, and the one
+`sync/diff` compares — is `meta.file_hash`. Comparing a local digest against
+`hash` appears to work on clean LF markdown, where extraction is close enough to
+the identity, and silently re-uploads everything else.
 
 **Retrieval settings do not behave as their names suggest.**
 `ENABLE_RAG_HYBRID_SEARCH` defaults to off, and while it is off the API silently
-ignores `hybrid: true`. With it on and no reranking model configured, every query
-re-embeds its candidates — on CPU that is seconds per chunk, and the cost scales
+ignores `hybrid: true`. With it *on*, `hybrid: false` does not turn it off either:
+the handler's else-branch calls `query_collection`, which re-reads the same flag
+and runs hybrid search with the global `k_reranker`/`r`/`bm25_weight` instead of
+the call's. The parameter only ever chose which set of parameters applied, so the
+tools expose the knobs and not the switch. With hybrid on and no reranking model
+configured, every query re-embeds its candidates — on CPU that is seconds per chunk, and the cost scales
 with `top_k`. `RELEVANCE_THRESHOLD` lives only on that same hybrid path, so on
 the cheap path it does nothing: retrieval always returns `top_k` chunks, however
 irrelevant. That is why the MCP server filters by `MIN_SCORE` itself. The two
