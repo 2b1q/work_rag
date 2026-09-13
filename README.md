@@ -123,6 +123,7 @@ guess a uuid.
 | `upload_document` | put text into a collection, by content |
 | `upload_document_from_path` | the same, but the server reads the file off disk itself |
 | `wait_pending` | block until a collection's embedding queue drains, or one file is linked |
+| `doctor_collection` | check the vectors are really there: collection store, sampled file stores, optional probe |
 | `dedupe_collection` | keep the newest file of each name, remove the rest; dry run by default |
 | `remove_document` | take a file out of a collection — which also deletes it, see below |
 
@@ -375,23 +376,42 @@ access to the script, and it measures the server rather than the runner.
 
 ### Is a collection intact?
 
-Three checks, cheapest first. The first two cost one call each and catch the
+`doctor_collection` answers this in one call per collection, and it catches the
 failure that looks like nothing at all — every document listed, `failed` empty,
-and no search result.
+and no search result. It goes through OpenWebUI's retrieval API only, cheapest
+check first:
 
-1. **Count the vector stores against the files.** OpenWebUI writes a `file-{id}`
-   store per document, so the number of `file-*` collections in the vector
-   database should match the collection's file count. A shortfall names how many
-   documents are lost, not merely that something is.
-2. **Ask whether the collection exists in the vector database at all**, under its
-   own id. A knowledge collection with no store behind it is intact in Postgres
-   and empty to every query.
-3. **Run a probe query.** This is the one that catches a store that exists and is
-   empty, and it is the only check that exercises the retrieval path end to end.
+1. **Embedding dates**, from the listing it already needs. A collection whose
+   newest `updated_at` predates its newest content has not been embedded since
+   that content arrived.
+2. **The collection's own vector store.** A knowledge collection with no store
+   behind it is intact in Postgres and empty to every query. OpenWebUI answers a
+   lookup against a store it cannot find with `null`, not an error, which is what
+   tells missing from empty.
+3. **Per-file stores, on a sample**: the oldest and newest file by `updated_at`,
+   plus `sample` random ones. Both losses seen so far were a boundary in time —
+   everything embedded before a date gone — and a purely random sample can land
+   entirely on one side of it. When the dead files all predate the live ones the
+   result names that `boundary`.
+4. **A probe query**, only if you pass `probe`: the one check that exercises
+   retrieval end to end. Its score is reported, not judged.
 
-The embedding date is the fastest smell of the three: a collection whose newest
-`updated_at` predates its newest content has not been embedded since that content
-arrived.
+**Run it after every sync**, once `wait_pending` returns `settled: true`. Both
+losses so far were found by accident, days late; right after a write is when a
+wiped volume shows first, and the default sample costs a handful of query
+embeddings per collection.
+
+A store that looks dead is asked again once before it counts: OpenWebUI turns any
+search error into the same `null`, and a hiccup mid-run must not read as a loss.
+`recovered_on_recheck` above zero means the upstream was unsteady, not lossy.
+
+Unless the sample covered every file, the verdict is an estimate and says so in
+`basis`. Scattered loss — thirty dead files out of three hundred — shows as a
+rough percentage, not a list. The exact count is a host-side check the tool does
+not make, because the server does not talk to the vector database: OpenWebUI
+writes a `file-{id}` store per document, so the number of `file-*` collections in
+Chroma should match the collection's file count, and a shortfall names how many
+documents are lost.
 
 ## Designing collections
 

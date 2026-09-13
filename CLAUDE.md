@@ -34,7 +34,7 @@ belong to OpenWebUI; going around it would fork the ranking behaviour.
 ## MCP tools
 
 Read: `ping_openwebui` · `list_collections` · `list_documents` · `get_document` ·
-`select_context_files` · `search_knowledge` · `wait_pending`.
+`select_context_files` · `search_knowledge` · `wait_pending` · `doctor_collection`.
 Write: `create_collection` · `upload_document` · `upload_document_from_path` ·
 `dedupe_collection` · `remove_document`. The path variant reads only under
 `OPENWEBUI_UPLOAD_ROOTS`, which is empty by default and refuses every path.
@@ -65,8 +65,10 @@ claude mcp add --scope user --transport http openwebui-knowledge http://localhos
 None in this repo — the stack is infrastructure, and the routines that use it
 belong to the repos whose documents live in the collections. The pattern worth
 copying is a session-close skill that (1) writes findings into their real homes,
-(2) regenerates a short digest, (3) syncs changed documents. It lives in the
-consumer repo that owns the collection, not here.
+(2) regenerates a short digest, (3) syncs changed documents, (4) once
+`wait_pending` settles, calls `doctor_collection` — an empty queue says the writes
+landed, not that the vectors survived. It lives in the consumer repo that owns the
+collection, not here.
 
 ## Rules of engagement
 

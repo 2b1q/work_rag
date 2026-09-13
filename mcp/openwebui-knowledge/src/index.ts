@@ -146,14 +146,14 @@ function headers(): Record<string, string> {
     };
 }
 
-async function request(path: string, init: RequestInit = {}): Promise<Response> {
+async function request(path: string, init: RequestInit = {}, timeoutMs = HTTP_TIMEOUT_MS): Promise<Response> {
     const url = `${OPENWEBUI_BASE_URL}${path}`;
     let res: Response;
     try {
         res = await fetch(url, {
             ...init,
             headers: headers(),
-            signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
+            signal: AbortSignal.timeout(timeoutMs),
         });
     } catch (err) {
         throw transportError(url, err);
@@ -170,8 +170,8 @@ async function getJson<T>(path: string): Promise<T> {
     return (await request(path)).json() as Promise<T>;
 }
 
-async function postJson<T>(path: string, body: unknown): Promise<T> {
-    return (await request(path, { method: "POST", body: JSON.stringify(body) })).json() as Promise<T>;
+async function postJson<T>(path: string, body: unknown, timeoutMs?: number): Promise<T> {
+    return (await request(path, { method: "POST", body: JSON.stringify(body) }, timeoutMs)).json() as Promise<T>;
 }
 
 function qs(params: Record<string, string | number | undefined>): string {
@@ -839,6 +839,191 @@ async function searchCollections(
 }
 
 /* ------------------------------------------------------------------ *
+ * Collection health, through OpenWebUI only
+ * ------------------------------------------------------------------ */
+
+/**
+ * A vector store as the retrieval API sees it. `unknown` is a request that failed
+ * or never ran for lack of time: no answer about the store, and never a loss.
+ */
+export type StoreState = "present" | "empty" | "missing" | "unknown";
+
+const isDead = (s: StoreState) => s === "missing" || s === "empty";
+
+/**
+ * One nearest-neighbour lookup against a single named store. OpenWebUI's Chroma
+ * adapter swallows every search error and returns null, so a store that does not
+ * exist and one it cannot read are the same answer: `missing`. `hybrid: false` is
+ * honoured on this route, unlike query/collection, and keeps it one embedding.
+ */
+export async function storeState(collectionName: string, deadline = Infinity): Promise<StoreState> {
+    const left = Math.min(HTTP_TIMEOUT_MS, deadline - Date.now());
+    if (left <= 0) return "unknown";
+    try {
+        const raw = await postJson<RetrievalResponse | null>(
+            "/api/v1/retrieval/query/doc",
+            { collection_name: collectionName, query: "health check", k: 1, hybrid: false },
+            left
+        );
+        if (!raw) return "missing";
+        return (raw.documents?.[0]?.length ?? 0) > 0 ? "present" : "empty";
+    } catch (err) {
+        // A timeout or a restarting upstream says nothing about the store. Thrown,
+        // it would take the whole report down, recheck included.
+        LOG(`store check ${collectionName}: ${err instanceof Error ? err.message : String(err)}`);
+        return "unknown";
+    }
+}
+
+/**
+ * Oldest and newest by embedding time, then `random` more. Both losses seen so far
+ * were a boundary in time — everything embedded before a date gone, after it
+ * intact — and a purely random sample can land entirely on one side of it.
+ */
+export function pickSample<T extends FileItem>(files: T[], random: number, rand: () => number = Math.random): T[] {
+    const sorted = [...files].sort((a, b) => stamp(a) - stamp(b));
+    if (sorted.length <= random + 2) return sorted;
+    const ends = [sorted[0]!, sorted[sorted.length - 1]!];
+    const middle = sorted.slice(1, -1);
+    for (let i = 0; i < random; i++) {
+        const j = i + Math.floor(rand() * (middle.length - i));
+        [middle[i], middle[j]] = [middle[j]!, middle[i]!];
+    }
+    return [...ends, ...middle.slice(0, random)];
+}
+
+// Long enough for a restarting upstream to come back, short against the call budget.
+const RECHECK_PAUSE_MS = 1500;
+
+export type Verdict = "ok" | "partial_loss" | "lost" | "no_collection_store" | "empty_collection" | "inconclusive";
+
+/** `deadline` is shared by every collection in the call: checks it cuts off are `unknown`. */
+export async function diagnoseCollection(collectionId: string, sampleRandom: number, probe?: string, deadline = Infinity) {
+    const [files, pending, failed] = await Promise.all([
+        allFiles(collectionId),
+        pendingFiles(collectionId).catch(() => [] as FileItem[]),
+        failedFiles(collectionId).catch(() => [] as FileItem[]),
+    ]);
+
+    const queue = { pending: pending.length, failed_recent: failed.map(describeFailure) };
+    if (files.length === 0) {
+        return { collection: collectionId, verdict: "empty_collection" as Verdict, files: 0, ...queue };
+    }
+
+    // 1. Dates: free, from the listing already in hand. updated_at is stamped when
+    // embedding finishes, so a file never embedded since its upload predates itself.
+    const stamps = files.map(stamp);
+    const notEmbedded = files.filter((f) => f.updated_at !== undefined && f.created_at !== undefined && f.updated_at < f.created_at);
+    const dates = {
+        oldest_embedding: Math.min(...stamps),
+        newest_embedding: Math.max(...stamps),
+        newest_upload: Math.max(...files.map((f) => f.created_at ?? 0)),
+        ...(notEmbedded.length > 0 ? { embedded_before_upload: notEmbedded.length } : {}),
+    };
+
+    // 2. The collection's own store, then per-file stores on a sample.
+    let collectionStore = await storeState(collectionId, deadline);
+    const sample = pickSample(files, sampleRandom);
+    const states = await mapLimit(sample, 4, async (f) => ({
+        file_id: f.id,
+        name: fileName(f),
+        updated_at: stamp(f),
+        store: await storeState(`file-${f.id}`, deadline),
+    }));
+
+    // The adapter turns any search error into null, so a hiccup mid-run reads as a
+    // lost store. A false alarm is how reports stop being read: ask again, once.
+    const suspect = states.filter((s) => s.store !== "present");
+    const rechecked = suspect.length + (collectionStore !== "present" ? 1 : 0);
+    let recovered = 0;
+    if (rechecked > 0 && deadline - Date.now() > RECHECK_PAUSE_MS) await sleep(RECHECK_PAUSE_MS);
+    if (collectionStore !== "present") {
+        collectionStore = await storeState(collectionId, deadline);
+        if (collectionStore === "present") recovered++;
+    }
+    if (suspect.length > 0) {
+        await mapLimit(suspect, 4, async (s) => {
+            s.store = await storeState(`file-${s.file_id}`, deadline);
+            if (s.store === "present") recovered++;
+        });
+    }
+    const dead = states.filter((s) => isDead(s.store));
+    const unknown = states.filter((s) => s.store === "unknown").length + (collectionStore === "unknown" ? 1 : 0);
+    const exhaustive = sample.length === files.length;
+
+    // A clean split in time is the signature worth naming: it dates the loss.
+    const byTime = [...states].sort((a, b) => a.updated_at - b.updated_at);
+    const firstAlive = byTime.findIndex((s) => s.store === "present");
+    const boundary =
+        firstAlive > 0 &&
+        byTime.slice(0, firstAlive).every((s) => isDead(s.store)) &&
+        byTime.slice(firstAlive).every((s) => s.store === "present")
+            ? { dead_up_to: byTime[firstAlive - 1]!.updated_at, alive_from: byTime[firstAlive]!.updated_at }
+            : undefined;
+
+    // 3. The retrieval path end to end, only when the caller brings a query. No
+    // floor is applied: a floor belongs to the corpus and would judge, not measure.
+    const probeResult =
+        probe && Date.now() < deadline
+            ? await searchCollections([collectionId], probe, 3).then(
+                  (hits) => ({
+                      query: probe,
+                      hits: hits.length,
+                      best_score: hits.length ? Math.max(...hits.map((h) => h.score ?? 0)) : undefined,
+                  }),
+                  (err) => ({ query: probe, error: err instanceof Error ? err.message : String(err) })
+              )
+            : probe
+              ? { query: probe, error: "skipped: the call's time budget was spent" }
+              : undefined;
+
+    // A loss confirmed twice outranks a check that got no answer; with no loss
+    // confirmed, a missing answer is not permission to say ok.
+    const verdict: Verdict = isDead(collectionStore)
+        ? "no_collection_store"
+        : dead.length > 0
+          ? dead.length === states.length
+              ? "lost"
+              : "partial_loss"
+          : unknown > 0
+            ? "inconclusive"
+            : "ok";
+
+    // Only the random part estimates a rate; the two ends were chosen, not drawn.
+    const drawn = (exhaustive ? states : states.slice(2)).filter((s) => s.store !== "unknown");
+    const drawnDead = drawn.filter((s) => isDead(s.store)).length;
+    const basis =
+        (exhaustive
+            ? `every file checked (${files.length})` + (unknown === 0 ? ": the per-file counts are exact" : "")
+            : `estimate from a sample of ${states.length} of ${files.length} files (oldest, newest, ${states.length - 2} random)` +
+              (drawn.length > 0
+                  ? `; ${drawnDead} of ${drawn.length} random answered dead, roughly ${Math.round((100 * drawnDead) / drawn.length)}%`
+                  : "")) + (unknown > 0 ? `; ${unknown} store check(s) got no answer, so this is incomplete` : "");
+
+    return {
+        collection: collectionId,
+        verdict,
+        basis,
+        files: files.length,
+        dates,
+        collection_store: collectionStore,
+        file_stores: { checked: states.length, dead: dead.length, exhaustive, ...(boundary ? { boundary } : {}), sample: states },
+        // A store that answered null and then answered: not lost, but not steady either.
+        ...(rechecked > 0 ? { rechecked, recovered_on_recheck: recovered } : {}),
+        ...(unknown > 0 ? { unanswered: unknown } : {}),
+        ...(probeResult ? { probe: probeResult } : {}),
+        ...queue,
+        ...(exhaustive
+            ? {}
+            : {
+                  not_covered:
+                      "Scattered partial loss shows here as a rough percentage, not a list of files. The exact " +
+                      "count of file-* stores is a host-side check against the vector database; see the README.",
+              }),
+    };
+}
+
+/* ------------------------------------------------------------------ *
  * MCP server
  * ------------------------------------------------------------------ */
 
@@ -1387,6 +1572,8 @@ function createMcpServer(): McpServer {
                 "same bytes will not help. Check `replace_done` too: a replace that failed to remove the " +
                 "old version, or never linked before its deadline, is finished and therefore absent from " +
                 "`replace_pending` — `settled: true` alone does not mean the collection is clean. " +
+                "After a sync settles, call doctor_collection: an empty queue says the writes landed, " +
+                "not that the vectors are still there. " +
                 "Defaults to 45 s: the cap is 55 but an MCP call over a bridge is cut at about 60 and " +
                 "the bridge's own overhead takes several seconds of that.",
             inputSchema: {
@@ -1569,6 +1756,57 @@ function createMcpServer(): McpServer {
                 skipped,
             });
         })
+    );
+
+    mcp.registerTool(
+        "doctor_collection",
+        {
+            title: "Check a collection is intact",
+            description:
+                "Check whether a collection's vectors are really there, cheapest check first: embedding " +
+                "dates from the listing, whether the collection's own vector store exists, and a lookup " +
+                "in the per-file stores of the oldest and newest file by `updated_at` plus `sample` " +
+                "random ones. Catches the loss that looks like nothing — every document listed, `failed` " +
+                "empty, no search result. Pass `probe`, a query the collection should answer, to run the " +
+                "retrieval path end to end; its score is reported, not judged. `verdict` is ok, " +
+                "partial_loss, lost, no_collection_store, empty_collection or inconclusive — a check that " +
+                "failed or ran out of time is `unknown`, never a loss, and with no loss confirmed it makes " +
+                "the verdict inconclusive rather than ok. The call stops checking at 45 s. `basis` says what it " +
+                "rests on: unless `exhaustive`, it is an estimate from a sample, and scattered loss " +
+                "shows as a percentage, not a list. A `boundary` means the dead files all predate the " +
+                "live ones, which dates the loss. A store that looks dead is asked again once before it " +
+                "counts; `recovered_on_recheck` above zero means the upstream was unsteady, not lossy. " +
+                "Call it after every sync, once wait_pending returns `settled: true` — right after a " +
+                "write is when a wiped volume shows first. Each checked store costs one query embedding.",
+            inputSchema: {
+                collection: z.string().optional(),
+                collections: z.array(z.string().min(1)).min(1).max(10).optional(),
+                // Each sampled store is one embedding on CPU; 10 collections at 20 fit the budget.
+                sample: z.number().int().min(0).max(20).optional(),
+                probe: z.string().min(1).optional(),
+            },
+            annotations: READS,
+        },
+        guard(
+            async ({ collection, collections, sample, probe }: { collection?: string; collections?: string[]; sample?: number; probe?: string }) => {
+                const refs = collections?.length ? collections : [collection ?? ""];
+                const ids = await mapLimit(refs, 4, (ref) => resolveCollection(ref || undefined));
+                // Past the bridge's cut there is no report at all, so checks stop at the
+                // same default the other blocking tools use and report what they have.
+                const deadline = Date.now() + WAIT_DEFAULT_S * 1000;
+                const reports = await mapLimit(ids, 2, (id) =>
+                    diagnoseCollection(id, sample ?? 5, probe, deadline).catch((err) => ({
+                        collection: id,
+                        verdict: "inconclusive" as Verdict,
+                        error: {
+                            code: err instanceof ToolError ? err.code : "internal_error",
+                            message: err instanceof Error ? err.message : String(err),
+                        },
+                    }))
+                );
+                return ok({ ok: true, collections: reports });
+            }
+        )
     );
 
     mcp.registerTool(
