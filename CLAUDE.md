@@ -25,6 +25,7 @@ belong to OpenWebUI; going around it would fork the ranking behaviour.
 | Path | What |
 | --- | --- |
 | [docker-compose.yaml](docker-compose.yaml) | the stack; image tags are pinned on purpose |
+| [docker-compose.override.example.yaml](docker-compose.override.example.yaml) | template for the gitignored local override; host paths and per-deployment policy live there |
 | [mcp/openwebui-knowledge/src/index.ts](mcp/openwebui-knowledge/src/index.ts) | the whole MCP server, single file |
 | [prompts/](prompts/) | system prompt used in the OpenWebUI chat UI |
 | `.env` | credentials and per-deployment settings — gitignored, see `.env.example` |

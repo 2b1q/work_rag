@@ -262,6 +262,40 @@ traced back to its file. There is no offset: the markdown header splitter this
 stack runs leaves the chunk's `start_index` at 0 on every chunk, so reporting it
 would only look like traceability it does not have.
 
+## Extending the stack
+
+The compose file defines a knowledge base, not a platform. Anything else you
+run next to it — a local inference engine, a scheduler, a proxy that exposes
+stdio MCP servers over HTTP — is yours, and there are two places to put it.
+
+**An override, for settings that describe this deployment.**
+[docker-compose.override.example.yaml](docker-compose.override.example.yaml) is
+a copy-and-edit template; the real `docker-compose.override.yaml` is gitignored,
+which is what keeps one person's disk layout and one deployment's policy out of
+a public repo. It covers the three that come up: host mounts for path uploads,
+pointing OpenWebUI at a local engine, and cutting a deployment off from the
+upstream vendor entirely.
+
+**A second compose project, for services of your own.** Give it its own
+directory and join this one's network as external:
+
+```yaml
+networks:
+  work_rag:
+    external: true
+    name: work-rag_default   # COMPOSE_PROJECT_NAME with _default appended
+```
+
+Both sides then resolve each other by service name, and `docker compose down`
+in one does not take the other with it. The alternative — growing the override
+until it is a second stack in disguise — costs you that, and the ability to say
+what this repo is.
+
+One platform note, because it is silent when you get it wrong: on macOS the
+inference engine belongs on the host, not in a container. Docker Desktop is a
+Linux VM with no access to Metal, so an engine started under compose runs on CPU
+and reports nothing unusual while doing it.
+
 ## Exposure
 
 Everything here is meant to run on one machine. Three things decide how much of
@@ -435,6 +469,22 @@ A consumer repo of this stack uses a sync tool built on this idea: it splits its
 logs by heading and by dated row, hashes every artifact, and uploads only what
 changed.
 
+**Write the decision where it can be retrieved alone.** The failure this
+prevents is not a missing document — it is a correct one, read wrongly. A
+hardware note explained that the controller board carries an onboard IMU whose
+part depends on the board revision, and that the project does not use it: it
+reads a different IMU from the host instead. The rejected part appeared four
+times in that chunk — revision, I²C address, firmware, a way to tell the
+revisions apart — and the adopted one once, in a subordinate clause. Asked which
+IMU the project uses, a small model answered with the rejected part.
+
+Retrieval had done its job; the chunk was the right one. The asymmetry is
+structural: a rejected option needs explaining and an adopted one usually does
+not, so documents describe what they ruled out in more detail than what they
+chose. Where that happens, put the decision in its own short block near the top
+of the document, so a query about it retrieves the decision rather than the
+history around it.
+
 ## Retrieval settings that matter
 
 Found by measurement on this stack; the defaults are not good for every corpus.
@@ -473,6 +523,7 @@ Embeddings are computed locally on CPU, so indexing costs time rather than money
 | Path | What |
 | --- | --- |
 | [docker-compose.yaml](docker-compose.yaml) | the stack, with pinned image tags |
+| [docker-compose.override.example.yaml](docker-compose.override.example.yaml) | template for the gitignored local override |
 | [mcp/openwebui-knowledge/](mcp/openwebui-knowledge/src/index.ts) | the MCP server (TypeScript) |
 | [prompts/system-prompt.md](prompts/system-prompt.md) | knowledge-first system prompt used in the chat UI |
 | `.env` | credentials and per-deployment settings (gitignored) |
