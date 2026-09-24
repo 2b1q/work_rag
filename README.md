@@ -307,6 +307,18 @@ reverse proxy. ChromaDB has no authentication of its own and is bound to
 the compose network as `vector-db`, and published on every interface it is an open
 vector store on the LAN. The MCP bridge is on `127.0.0.1:8787`.
 
+⚠️ **`WEBUI_BIND_PORT` carries the interface, and the shipped value has none.**
+`"${WEBUI_BIND_PORT}:8080"` with the default `3000` publishes on **every**
+interface. Measured on a laptop on a home network: `http://<lan-ip>:3000`
+answered `200`, while `:8787` from that same address did not answer at all. A
+login page is not the corpus, but it is the only thing between a guest on that
+Wi-Fi and the whole knowledge base. Put the interface in the variable to keep it
+local:
+
+```sh
+WEBUI_BIND_PORT=127.0.0.1:3000   # .env - loopback only
+```
+
 **Origin.** `/mcp` refuses any request that carries an `Origin` header not listed
 in `MCP_ALLOWED_ORIGINS` (empty by default). An MCP client sends no Origin at
 all; a browser always does. That is what stops a page the user has open from
